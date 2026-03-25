@@ -47,6 +47,7 @@ from firecracker_vm.atari_client import AtariClient
 from firecracker_vm import FirecrackerVM, VMConfig, VMPool
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -87,11 +88,16 @@ def run_tree_search(
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     frame_count = 0
-    # Track the action history for each saved frame
-    # Maps filename -> list of actions taken to reach that state
-    frame_history: dict[str, list[int]] = {}
-    # The action path leading to the current root state
-    current_path: list[int] = []
+    # Track full history for each frame:
+    #   filename -> { "actions": [1, 0, ...], "rewards": [0.0, 1.0, ...] }
+    frame_history: dict[str, dict] = {}
+    current_actions: list[int] = []
+    current_rewards: list[float] = []
+    history_path = frames_dir / "history.json"
+
+    def save_history():
+        with open(history_path, "w") as f:
+            json.dump(frame_history, f, indent=2)
 
     stats = {
         "iteration_times_ms": [],
@@ -125,9 +131,10 @@ def run_tree_search(
     initial_obs = client.reset()
     frame_name = f"frame_{frame_count:06d}.png"
     save_frame(initial_obs, str(frames_dir / frame_name))
-    frame_history[frame_name] = []  # root frame, no actions taken
+    frame_history[frame_name] = {"actions": [], "rewards": []}
     frame_count += 1
     client.close()
+    save_history()
 
     print(f"Boot + reset took {(time.monotonic() - t_boot)*1000:.1f}ms")
     print()
@@ -155,6 +162,7 @@ def run_tree_search(
             # Step each child with a different action and collect frames
             t_step = time.monotonic()
             child_frames = []
+            child_rewards = []
 
             for child_idx, (child_vm, action) in enumerate(
                 zip(fork_result.children, actions)
@@ -166,11 +174,15 @@ def run_tree_search(
 
                 obs, reward, done, info = child_client.step(action)
                 child_frames.append(obs)
+                child_rewards.append(reward)
 
-                # Save frame with history
+                # Save frame with full action+reward history
                 frame_name = f"frame_{frame_count:06d}.png"
                 save_frame(obs, str(frames_dir / frame_name))
-                frame_history[frame_name] = current_path + [action]
+                frame_history[frame_name] = {
+                    "actions": current_actions + [action],
+                    "rewards": current_rewards + [reward],
+                }
                 frame_count += 1
 
                 child_client.close()
@@ -185,12 +197,13 @@ def run_tree_search(
             # Select a random child as the new root
             selected_idx = random.randint(0, num_actions - 1)
             selected_action = actions[selected_idx]
+            selected_reward = child_rewards[selected_idx]
             print(f"  Selected child {selected_idx} "
                   f"(action {selected_action})")
 
-            # Update the current path — the selected child's action
-            # becomes part of the path for all future frames
-            current_path = current_path + [selected_action]
+            # Update the current path
+            current_actions = current_actions + [selected_action]
+            current_rewards = current_rewards + [selected_reward]
 
             # Destroy the current parent VM (no longer needed)
             current_vm.destroy()
@@ -203,17 +216,15 @@ def run_tree_search(
             print(f"  Total iteration: {iter_ms:.1f}ms")
             print()
 
+            save_history()
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     finally:
         current_vm.destroy()
         pool.shutdown()
 
-    # Save frame history
-    import json
-    history_path = frames_dir / "history.json"
-    with open(history_path, "w") as f:
-        json.dump(frame_history, f, indent=2)
+    save_history()
     print(f"Frame history saved to {history_path}")
 
     stats["total_frames"] = frame_count
