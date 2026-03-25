@@ -147,7 +147,7 @@ fn main() -> Result<()> {
 
     // --- Phase 2: Tree search ---
     let pool_dir = frames_dir.parent().unwrap_or(frames_dir).join("vm-pool");
-    let pool = VMPool::new(pool_dir, num_actions)?;
+    let pool = VMPool::new(pool_dir, num_actions, config.clone())?;
 
     let mut current_vm = root_vm;
 
@@ -160,27 +160,36 @@ fn main() -> Result<()> {
         let fork_result = pool.fork(&mut current_vm, num_actions)?;
         println!("  Fork: {:.1}ms", t_fork.elapsed().as_secs_f64() * 1000.0);
 
-        // Step each child
+        // Step each child in parallel
         let t_step = Instant::now();
-        let mut child_rewards = Vec::new();
 
-        // We need to process children, but fork_result owns them.
-        // Collect results first, then move children out.
+        let step_handles: Vec<_> = actions
+            .iter()
+            .enumerate()
+            .map(|(child_idx, action)| {
+                let vsock_path = fork_result.children[child_idx].vsock_uds_path();
+                let action = *action;
+                std::thread::spawn(move || -> anyhow::Result<(i64, atari_client::StepResult)> {
+                    let mut client = AtariClient::connect_vsock(
+                        &vsock_path,
+                        std::time::Duration::from_secs(10),
+                    )?;
+                    let result = client.step(action)?;
+                    Ok((action, result))
+                })
+            })
+            .collect();
+
         let mut step_results = Vec::new();
-
-        for (child_idx, action) in actions.iter().enumerate() {
-            let child_vm = &fork_result.children[child_idx];
-            let mut client = AtariClient::connect(
-                &child_vm.vsock_uds_path(),
-                &mut None::<std::io::Empty>,
-                true,
-                std::time::Duration::from_secs(10),
-            )?;
-
-            let result = client.step(*action)?;
-            step_results.push((*action, result));
+        for handle in step_handles {
+            step_results.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("step thread panicked"))??,
+            );
         }
 
+        let mut child_rewards = Vec::new();
         for (action, result) in &step_results {
             child_rewards.push(result.reward);
 

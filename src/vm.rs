@@ -124,14 +124,15 @@ impl FirecrackerVM {
 
         self.process = Some(child);
 
-        // Wait for socket to become available
-        for _ in 0..100 {
+        // Wait for API socket to appear — poll every 5ms instead of 100ms
+        for _ in 0..2000 {
             if self.socket_path.exists() {
+                // Try a quick API call to confirm Firecracker is listening
                 if self.api_call("GET", "/", None).is_ok() {
                     return Ok(());
                 }
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(5));
         }
         bail!("Firecracker failed to start. Check {:?}", self.log_path)
     }
@@ -364,8 +365,22 @@ Accept: application/json\r\n\
         let mut vm = Self::new(snapshot.config.clone(), Some(work_dir), vm_id)?;
         vm.rootfs_path = rootfs_path.unwrap_or_else(|| snapshot.rootfs_path.clone());
         vm.spawn_process()?;
+        vm.load_snapshot(snapshot, resume)?;
+        Ok(vm)
+    }
 
-        vm.api_call(
+    /// Create a VM with a spawned Firecracker process, ready for snapshot load.
+    /// The process is started and the API socket is verified, but no VM is configured.
+    pub fn new_idle(config: VMConfig, work_dir: PathBuf, vm_id: &str) -> Result<Self> {
+        let mut vm = Self::new(config, Some(work_dir), vm_id)?;
+        vm.spawn_process()?;
+        Ok(vm)
+    }
+
+    /// Load a snapshot into an already-spawned Firecracker process.
+    pub fn load_snapshot(&mut self, snapshot: &Snapshot, resume: bool) -> Result<()> {
+        self.rootfs_path = snapshot.rootfs_path.clone();
+        self.api_call(
             "PUT",
             "/snapshot/load",
             Some(json!({
@@ -378,13 +393,12 @@ Accept: application/json\r\n\
                 "resume_vm": resume,
             })),
         )?;
-
-        vm.state = if resume {
+        self.state = if resume {
             VMState::Running
         } else {
             VMState::Paused
         };
-        Ok(vm)
+        Ok(())
     }
 
     /// Get the absolute path to the vsock UDS.
