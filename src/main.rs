@@ -120,12 +120,9 @@ fn main() -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    eprintln!("[debug] Got AGENT_READY!");
 
     // Connect to vsock
-    eprintln!("[debug] Connecting to vsock...");
     let mut client = AtariClient::connect_vsock(&vsock_path, std::time::Duration::from_secs(10))?;
-    eprintln!("[debug] Vsock connected!");
 
     let actions = client.get_legal_actions()?;
     let num_actions = actions.len();
@@ -151,14 +148,23 @@ fn main() -> Result<()> {
 
     let mut current_vm = root_vm;
 
+    // Background cleanup — destroy old parent VMs without blocking the hot path
+    let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel::<FirecrackerVM>();
+    let _cleanup_thread = std::thread::spawn(move || {
+        for mut vm in cleanup_rx {
+            let dir = vm.work_dir.clone();
+            vm.destroy();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+
     for iteration in 0..args.iterations {
         let t_iter = Instant::now();
-        println!("--- Iteration {}/{} ---", iteration + 1, args.iterations);
 
         // Fork
         let t_fork = Instant::now();
         let fork_result = pool.fork(&mut current_vm, num_actions)?;
-        println!("  Fork: {:.1}ms", t_fork.elapsed().as_secs_f64() * 1000.0);
+        let fork_ms = t_fork.elapsed().as_secs_f64() * 1000.0;
 
         // Step each child in parallel
         let t_step = Instant::now();
@@ -189,6 +195,9 @@ fn main() -> Result<()> {
             );
         }
 
+        let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+
+        // Record results
         let mut child_rewards = Vec::new();
         for (action, result) in &step_results {
             child_rewards.push(result.reward);
@@ -208,40 +217,37 @@ fn main() -> Result<()> {
                 }),
             );
             frame_count += 1;
-
-            println!(
-                "  Action {}: reward={:.1}, done={}",
-                action, result.reward, result.done
-            );
         }
-
-        println!(
-            "  Step all: {:.1}ms",
-            t_step.elapsed().as_secs_f64() * 1000.0
-        );
 
         // Select random child
         let selected_idx = rng.gen_range(0..num_actions);
         let selected_action = actions[selected_idx];
         let selected_reward = child_rewards[selected_idx];
-        println!(
-            "  Selected child {} (action {})",
-            selected_idx, selected_action
-        );
 
         current_actions.push(selected_action);
         current_rewards.push(selected_reward);
 
-        current_vm.destroy();
-        current_vm = pool.select_and_cleanup(fork_result, selected_idx);
-
-        println!(
-            "  Total iteration: {:.1}ms",
-            t_iter.elapsed().as_secs_f64() * 1000.0
+        // Destroy old parent in background (it's paused, just needs kill+wait)
+        let old_vm = std::mem::replace(
+            &mut current_vm,
+            pool.select_and_cleanup(fork_result, selected_idx),
         );
-        println!();
+        let _ = cleanup_tx.send(old_vm);
 
-        save_history(&history_path, &frame_history)?;
+        let iter_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "Iter {}/{}: fork={:.1}ms step={:.1}ms total={:.1}ms",
+            iteration + 1,
+            args.iterations,
+            fork_ms,
+            step_ms,
+            iter_ms
+        );
+
+        // Save history periodically
+        if (iteration + 1) % 50 == 0 || iteration + 1 == args.iterations {
+            save_history(&history_path, &frame_history)?;
+        }
     }
 
     current_vm.destroy();

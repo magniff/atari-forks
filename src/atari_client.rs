@@ -30,7 +30,6 @@ impl AtariClient {
         if !skip_ready {
             // Watch serial for AGENT_READY
             if let Some(reader) = serial_stdout.as_mut() {
-                eprintln!("[debug] Waiting for AGENT_READY on serial...");
                 let deadline = std::time::Instant::now() + timeout;
                 let mut line = String::new();
                 loop {
@@ -42,11 +41,8 @@ impl AtariClient {
                         Ok(0) => bail!("EOF on serial before AGENT_READY"),
                         Ok(_) => {
                             let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                eprintln!("[debug] serial: {}", &trimmed[..trimmed.len().min(100)]);
-                            }
+                            if !trimmed.is_empty() {}
                             if line.contains(AGENT_READY_SENTINEL) {
-                                eprintln!("[debug] Got AGENT_READY!");
                                 break;
                             }
                         }
@@ -54,13 +50,10 @@ impl AtariClient {
                     }
                 }
             } else {
-                eprintln!("[debug] No serial handle, skipping AGENT_READY wait");
             }
         }
 
-        eprintln!("[debug] Connecting to vsock at {:?}...", vsock_uds_path);
         let stream = Self::do_connect_vsock(vsock_uds_path, timeout)?;
-        eprintln!("[debug] Vsock connected!");
         Ok(Self { stream })
     }
 

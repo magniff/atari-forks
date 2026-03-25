@@ -167,13 +167,6 @@ Accept: application/json\r\n\
         };
 
         (&stream).write_all(request.as_bytes())?;
-        eprintln!(
-            "[api] {} {} ({} bytes): {:?}",
-            method,
-            path,
-            request.len(),
-            &request[..request.len().min(200)]
-        );
 
         let mut reader = BufReader::new(&stream);
 
@@ -216,14 +209,6 @@ Accept: application/json\r\n\
         // Explicitly close the connection
         drop(reader);
         drop(stream);
-
-        eprintln!(
-            "[api] {} {} -> {} (body: {} bytes)",
-            method,
-            path,
-            status_code,
-            body_text.len()
-        );
 
         if status_code >= 400 {
             bail!(
