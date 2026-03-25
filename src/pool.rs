@@ -60,32 +60,27 @@ impl VMPool {
     ) -> Result<Vec<FirecrackerVM>> {
         use std::thread;
 
-        // Prepare child configs (must be done before spawning threads)
+        // Prepare child configs
         let child_configs: Vec<_> = (0..num_children)
             .map(|i| {
                 let child_id = format!("fork{fork_id}-child{i}");
                 let child_dir = self.base_dir.join(&child_id);
-                let child_rootfs = child_dir.join("rootfs.ext4");
-                (child_id, child_dir, child_rootfs)
+                (child_id, child_dir)
             })
             .collect();
 
-        // Copy rootfs for each child (could parallelize this too)
-        for (_, _, ref rootfs) in &child_configs {
-            snapshot.fork_rootfs(rootfs)?;
-        }
+        // No rootfs copy needed — rootfs is read-only and shared across all VMs.
+        // This eliminates the ~300-400ms per fork that was spent copying the 1GB image.
 
         // Spawn VMs in parallel
         let handles: Vec<_> = child_configs
             .into_iter()
-            .map(|(child_id, child_dir, child_rootfs)| {
+            .map(|(child_id, child_dir)| {
                 let snap = snapshot.clone();
                 thread::spawn(move || {
                     FirecrackerVM::restore_from_snapshot(
-                        &snap,
-                        child_dir,
-                        &child_id,
-                        Some(child_rootfs),
+                        &snap, child_dir, &child_id,
+                        None, // use snapshot's rootfs directly (read-only, shared)
                         true,
                     )
                 })

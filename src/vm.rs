@@ -37,7 +37,7 @@ impl Default for VMConfig {
             vcpu_count: 1,
             mem_size_mib: 256,
             boot_args:
-                "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on init=/opt/init.sh"
+                "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on ro init=/opt/init.sh"
                     .into(),
             track_dirty: true,
         }
@@ -276,7 +276,7 @@ Accept: application/json\r\n\
                 "drive_id": "rootfs",
                 "path_on_host": rootfs.to_str().unwrap(),
                 "is_root_device": true,
-                "is_read_only": false,
+                "is_read_only": true,
             })),
         )?;
         Ok(())

@@ -152,12 +152,15 @@ build_rootfs() {
     if [ -z "$method" ]; then
         if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
             method="docker"
+        elif command -v podman &>/dev/null; then
+            method="podman"
         elif command -v debootstrap &>/dev/null; then
             method="chroot"
         else
-            err "Cannot build rootfs: need either docker or debootstrap."
-            err "  Option A: Install docker and add yourself to the docker group"
-            err "  Option B: sudo apt install debootstrap, then run with --rootfs-method=chroot"
+            err "Cannot build rootfs. Install one of:"
+            err "  - podman (pacman -S podman, no root needed)"
+            err "  - docker"
+            err "  - debootstrap (needs sudo for mount/chroot)"
             exit 1
         fi
     fi
@@ -166,27 +169,29 @@ build_rootfs() {
 
     case "$method" in
         docker)  build_rootfs_docker "$rootfs" ;;
+        podman)  CONTAINER_CMD=podman build_rootfs_docker "$rootfs" ;;
         chroot)  build_rootfs_chroot "$rootfs" ;;
         *)       err "Unknown rootfs method: $method"; exit 1 ;;
     esac
 }
 
-# ── Method A: Build rootfs using Docker (no root needed) ─────────────
+# ── Method A: Build rootfs using Docker/Podman (no root needed) ──────
 #
-# This creates a Docker container with all dependencies, exports its
+# This creates a container with all dependencies, exports its
 # filesystem as a tarball, then packs it into an ext4 image.
-# The only tools needed on the host are docker and mkfs.ext4.
-# No mount/chroot/sudo required.
+# Works with docker or podman. No mount/chroot/sudo required
+# if fuse2fs is available for the final step.
 
 build_rootfs_docker() {
     local rootfs="$1"
+    local cmd="${CONTAINER_CMD:-docker}"
 
-    if ! command -v docker &>/dev/null; then
-        err "docker not found. Install it or use --rootfs-method=chroot"
+    if ! command -v "$cmd" &>/dev/null; then
+        err "$cmd not found."
         exit 1
     fi
 
-    log "Creating rootfs via Docker (no root required)..."
+    log "Creating rootfs via ${cmd}..."
 
     # Write a Dockerfile that installs everything the guest needs
     local build_dir
@@ -211,10 +216,13 @@ RUN chmod +x /usr/local/bin/atari_agent.py
 
 # Create a minimal init script.
 # Sets PYTHONPATH so pip-installed packages in /usr/local are found.
+# Mounts tmpfs at /tmp and /run so the read-only rootfs works.
 RUN printf '#!/bin/sh\n\
 mount -t proc proc /proc\n\
 mount -t sysfs sys /sys\n\
 mount -t devtmpfs dev /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mount -t tmpfs tmpfs /run\n\
 export PYTHONPATH=/usr/local/lib/python3.11/dist-packages\n\
 exec /usr/bin/python3 /usr/local/bin/atari_agent.py\n' > /opt/init.sh && \
     chmod +x /opt/init.sh
@@ -222,14 +230,14 @@ DOCKERFILE
 
     # Build the container
     local tag="atari-fork-rootfs"
-    docker build -t "$tag" "$build_dir"
+    $cmd build -t "$tag" "$build_dir"
 
     # Export the container filesystem as a tarball
     local container_id
-    container_id=$(docker create "$tag")
+    container_id=$($cmd create "$tag")
     local tarball="$build_dir/rootfs.tar"
-    docker export "$container_id" -o "$tarball"
-    docker rm "$container_id" > /dev/null
+    $cmd export "$container_id" -o "$tarball"
+    $cmd rm "$container_id" > /dev/null
 
     # Create an ext4 image and unpack the tarball into it.
     # This part needs either:
@@ -269,7 +277,7 @@ DOCKERFILE
     fi
 
     # Cleanup
-    docker rmi "$tag" > /dev/null 2>&1 || true
+    $cmd rmi "$tag" > /dev/null 2>&1 || true
     rm -rf "$build_dir"
 
     log "Rootfs built at ${rootfs}"
@@ -335,6 +343,8 @@ build_rootfs_chroot() {
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
 export PYTHONPATH=/usr/local/lib/python3.11/dist-packages
 exec /usr/bin/python3 /usr/local/bin/atari_agent.py
 INITEOF
