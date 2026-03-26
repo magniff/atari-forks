@@ -21,29 +21,36 @@ pub struct AtariClient {
 impl AtariClient {
     /// Connect to the guest agent via the vsock Unix socket.
     ///
-    /// Performs the Firecracker vsock handshake (CONNECT <port>\n → OK\n),
-    /// then returns a client ready for JSON-line commands.
+    /// After the Firecracker vsock handshake (`CONNECT` → `OK`), sends
+    /// a lightweight `get_actions` probe to confirm the Python agent
+    /// has actually `accept()`-ed this connection and is responsive.
+    ///
+    /// This matters after snapshot restore: the guest kernel needs to
+    /// tear down the stale pre-snapshot vsock connection before Python
+    /// cycles back to `accept()`. The Firecracker proxy returns `OK`
+    /// immediately (it just queues the connect request), so without
+    /// this probe we'd race the guest-side cleanup and occasionally
+    /// get EOF when sending the real command.
     pub async fn connect(vsock_uds_path: &Path, timeout: Duration) -> Result<Self> {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            if let Ok(stream) = UnixStream::connect(vsock_uds_path).await {
-                // Firecracker vsock handshake
-                let (read_half, mut write_half) = tokio::io::split(stream);
-                let mut reader = BufReader::new(read_half);
-
-                let cmd = format!("CONNECT {VSOCK_GUEST_PORT}\n");
-                write_half.write_all(cmd.as_bytes()).await?;
-
-                let mut response = String::new();
-                reader.read_line(&mut response).await?;
-
-                if response.starts_with("OK") {
-                    return Ok(Self {
-                        reader,
-                        writer: write_half,
-                    });
+            match Self::try_connect_once(vsock_uds_path).await {
+                Ok(mut client) => {
+                    // Probe: verify the Python agent is actually on
+                    // the other end, not a stale/dying connection.
+                    match client
+                        .send_command(&serde_json::json!({"cmd": "get_actions"}))
+                        .await
+                    {
+                        Ok(_) => return Ok(client),
+                        Err(_) => {
+                            // Connection was stale — drop it and retry.
+                            // Python is likely cycling back to accept().
+                        }
+                    }
                 }
+                Err(_) => { /* socket not ready yet, retry */ }
             }
 
             if tokio::time::Instant::now() > deadline {
@@ -52,7 +59,30 @@ impl AtariClient {
                     vsock_uds_path
                 );
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Attempt a single vsock connect + Firecracker handshake.
+    /// Returns Err if the socket isn't available or the handshake fails.
+    async fn try_connect_once(vsock_uds_path: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(vsock_uds_path).await?;
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+
+        let cmd = format!("CONNECT {VSOCK_GUEST_PORT}\n");
+        write_half.write_all(cmd.as_bytes()).await?;
+
+        let mut response = String::new();
+        reader.read_line(&mut response).await?;
+
+        if response.starts_with("OK") {
+            Ok(Self {
+                reader,
+                writer: write_half,
+            })
+        } else {
+            bail!("vsock handshake rejected: {}", response.trim());
         }
     }
 
