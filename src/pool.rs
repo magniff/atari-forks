@@ -33,16 +33,15 @@ impl Drop for ForkResult {
 /// work directories under `base_dir`.
 pub struct VMPool {
     pub base_dir: PathBuf,
-    pub max_parallel: usize,
     fork_counter: AtomicU64,
 }
 
 impl VMPool {
-    pub fn new(base_dir: PathBuf, max_parallel: usize) -> Result<Self> {
-        std::fs::create_dir_all(&base_dir)?;
+    pub async fn try_new(base_dir: PathBuf) -> Result<Self> {
+        tokio::fs::remove_dir_all(&base_dir).await?;
+        tokio::fs::create_dir_all(&base_dir).await?;
         Ok(Self {
             base_dir: std::fs::canonicalize(&base_dir)?,
-            max_parallel,
             fork_counter: AtomicU64::new(0),
         })
     }

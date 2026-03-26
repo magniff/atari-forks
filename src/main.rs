@@ -1,10 +1,10 @@
+use std::path::PathBuf;
+use std::time::Instant;
+
 use anyhow::Result;
 use clap::Parser;
 use rand::Rng;
-use serde_json::json;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Instant;
+use rand::SeedableRng;
 use tokio::io::AsyncBufReadExt;
 
 mod atari_client;
@@ -28,7 +28,7 @@ struct Args {
     #[arg(long)]
     rootfs: PathBuf,
 
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 100)]
     iterations: usize,
 
     #[arg(long, default_value = "./frames")]
@@ -37,39 +37,21 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     vcpus: u32,
 
-    /// Guest memory in MiB. ALE + Python fits in 128MB; lower = faster snapshots.
     #[arg(long, default_value_t = 128)]
     mem: u32,
 
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Directory for snapshots and child VM work dirs.
-    /// Point this at a tmpfs mount for best performance (avoids disk I/O
-    /// for the ~128MB memory snapshot). If --tmpfs is set, a tmpfs is
-    /// mounted here automatically.
     #[arg(long)]
     pool_dir: Option<PathBuf>,
-
-    /// Automatically mount a tmpfs at the pool directory.
-    /// Requires root (or CAP_SYS_ADMIN). Size is set to 2× guest memory
-    /// × max_children to hold snapshots + FC process working state.
-    /// The tmpfs is unmounted on exit.
-    #[arg(long, default_value_t = false)]
-    tmpfs: bool,
 }
 
-fn save_frame(data: &[u8], path: &PathBuf) -> Result<()> {
+async fn save_frame(data: &[u8], path: &PathBuf) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(path, data)?;
-    Ok(())
-}
-
-fn save_history(path: &PathBuf, history: &HashMap<String, serde_json::Value>) -> Result<()> {
-    let json = serde_json::to_string_pretty(history)?;
-    std::fs::write(path, json)?;
+    tokio::fs::write(path, data).await?;
     Ok(())
 }
 
@@ -130,7 +112,6 @@ async fn main() -> Result<()> {
 
     let frames_dir = &args.output;
     std::fs::create_dir_all(frames_dir)?;
-    let history_path = frames_dir.join("history.json");
 
     // ── Set up pool directory (optionally on tmpfs) ─────────────────
 
@@ -139,64 +120,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| frames_dir.parent().unwrap_or(frames_dir).join("vm-pool"));
     std::fs::create_dir_all(&pool_dir)?;
 
-    let mut tmpfs_mounted = false;
-    if args.tmpfs {
-        // Size the tmpfs to hold: 1 snapshot (mem_size) + N child work dirs
-        // (mostly just sockets/logs, a few KB each). 3× mem is plenty.
-        let tmpfs_size_mb = args.mem as u64 * 3;
-        let pool_dir_str = pool_dir.to_str().unwrap();
-        let status = std::process::Command::new("mount")
-            .args([
-                "-t",
-                "tmpfs",
-                "-o",
-                &format!("size={}m", tmpfs_size_mb),
-                "tmpfs",
-                pool_dir_str,
-            ])
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                tmpfs_mounted = true;
-                println!("Mounted tmpfs ({}MB) at {:?}", tmpfs_size_mb, pool_dir);
-            }
-            Ok(s) => {
-                eprintln!(
-                    "Warning: failed to mount tmpfs (exit {}). \
-                     Continuing with regular filesystem. \
-                     Run as root or use 'sudo' for tmpfs support.",
-                    s.code().unwrap_or(-1)
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: could not run mount command: {e}. \
-                     Continuing with regular filesystem."
-                );
-            }
-        }
-    }
-
-    // Guard: unmount tmpfs on exit (normal or early return via ?).
-    // Also detects if pool_dir is already a tmpfs even without --tmpfs.
-    let _tmpfs_guard = TmpfsGuard {
-        path: if tmpfs_mounted {
-            Some(pool_dir.clone())
-        } else {
-            None
-        },
-    };
-
     let mut frame_count = 0usize;
-    let mut frame_history: HashMap<String, serde_json::Value> = HashMap::new();
-    let mut current_actions: Vec<i64> = Vec::new();
-    let mut current_rewards: Vec<f64> = Vec::new();
 
     println!("Starting tree search: {} iterations", args.iterations);
     println!("Guest memory: {}MB", args.mem);
     println!("Output directory: {:?}", frames_dir);
-    println!("Pool directory: {:?} (tmpfs: {})", pool_dir, tmpfs_mounted);
     println!("Expected frames: {}", 1 + 4 * args.iterations);
     println!();
 
@@ -223,22 +151,17 @@ async fn main() -> Result<()> {
 
     let initial_obs = client.reset().await?;
     let frame_name = format!("frame_{:06}.png", frame_count);
-    save_frame(&initial_obs, &frames_dir.join(&frame_name))?;
-    frame_history.insert(frame_name, json!({"actions": [], "rewards": []}));
+    save_frame(&initial_obs, &frames_dir.join(&frame_name)).await?;
     frame_count += 1;
     drop(client);
-    save_history(&history_path, &frame_history)?;
 
     println!(
         "Boot + reset took {:.1}ms",
         t_boot.elapsed().as_secs_f64() * 1000.0
     );
-    println!();
 
     // ── Phase 2: Tree search ────────────────────────────────────────
-
-    let pool = VMPool::new(pool_dir, num_actions)?;
-
+    let pool = VMPool::try_new(pool_dir).await?;
     let mut current_vm = root_vm;
 
     for iteration in 0..args.iterations {
@@ -259,26 +182,10 @@ async fn main() -> Result<()> {
         );
 
         // Record results
-        let mut child_rewards = Vec::with_capacity(num_actions);
         for (action, result) in actions.iter().zip(step_results.iter()) {
-            child_rewards.push(result.reward);
-
             let frame_name = format!("frame_{:06}.png", frame_count);
-            save_frame(&result.obs, &frames_dir.join(&frame_name))?;
-
-            let mut hist_actions = current_actions.clone();
-            hist_actions.push(*action);
-            let mut hist_rewards = current_rewards.clone();
-            hist_rewards.push(result.reward);
-            frame_history.insert(
-                frame_name,
-                json!({
-                    "actions": hist_actions,
-                    "rewards": hist_rewards,
-                }),
-            );
+            save_frame(&result.obs, &frames_dir.join(&frame_name)).await?;
             frame_count += 1;
-
             println!(
                 "  Action {}: reward={:.1}, done={}",
                 action, result.reward, result.done
@@ -288,14 +195,10 @@ async fn main() -> Result<()> {
         // Select a random child as the new root
         let selected_idx = rng.gen_range(0..num_actions);
         let selected_action = actions[selected_idx];
-        let selected_reward = child_rewards[selected_idx];
         println!(
             "  Selected child {} (action {})",
             selected_idx, selected_action
         );
-
-        current_actions.push(selected_action);
-        current_rewards.push(selected_reward);
 
         // Destroy parent and unselected children, keep selected
         current_vm.destroy();
@@ -306,13 +209,9 @@ async fn main() -> Result<()> {
             t_iter.elapsed().as_secs_f64() * 1000.0
         );
         println!();
-
-        save_history(&history_path, &frame_history)?;
     }
 
     current_vm.destroy();
-    save_history(&history_path, &frame_history)?;
-    println!("Frame history saved to {:?}", history_path);
 
     println!();
     println!("============================================================");
@@ -321,20 +220,4 @@ async fn main() -> Result<()> {
     println!("Total frames saved: {}", frame_count);
 
     Ok(())
-}
-
-use rand::SeedableRng;
-
-/// RAII guard that unmounts a tmpfs on drop.
-struct TmpfsGuard {
-    path: Option<PathBuf>,
-}
-
-impl Drop for TmpfsGuard {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            eprintln!("[cleanup] Unmounting tmpfs at {:?}", path);
-            let _ = std::process::Command::new("umount").arg(path).status();
-        }
-    }
 }

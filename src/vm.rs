@@ -141,7 +141,7 @@ impl FirecrackerVM {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if self.socket_path.exists() {
-                if self.api_call("GET", "/", None).await.is_ok() {
+                if self.call_firecracker("GET", "/", None).await.is_ok() {
                     return Ok(());
                 }
             }
@@ -157,7 +157,12 @@ impl FirecrackerVM {
     /// Opens a fresh connection per call. Firecracker's API is
     /// single-threaded and low-frequency — connection reuse isn't
     /// worth the complexity of keeping an idle connection alive.
-    async fn api_call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+    async fn call_firecracker(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .context("connect to API socket")?;
@@ -225,7 +230,7 @@ impl FirecrackerVM {
     }
 
     async fn configure_machine(&self) -> Result<()> {
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/machine-config",
             Some(json!({
@@ -240,7 +245,7 @@ impl FirecrackerVM {
 
     async fn configure_boot_source(&self) -> Result<()> {
         let kernel = std::fs::canonicalize(&self.config.kernel_path)?;
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/boot-source",
             Some(json!({
@@ -253,7 +258,7 @@ impl FirecrackerVM {
     }
 
     async fn configure_rootfs(&self) -> Result<()> {
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/drives/rootfs",
             Some(json!({
@@ -268,7 +273,7 @@ impl FirecrackerVM {
     }
 
     async fn configure_vsock(&self) -> Result<()> {
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/vsock",
             Some(json!({
@@ -282,7 +287,7 @@ impl FirecrackerVM {
     }
 
     async fn start_instance(&mut self) -> Result<()> {
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/actions",
             Some(json!({
@@ -298,19 +303,9 @@ impl FirecrackerVM {
         if self.state != VMState::Running {
             bail!("Can only pause a running VM, got {:?}", self.state);
         }
-        self.api_call("PATCH", "/vm", Some(json!({"state": "Paused"})))
+        self.call_firecracker("PATCH", "/vm", Some(json!({"state": "Paused"})))
             .await?;
         self.state = VMState::Paused;
-        Ok(())
-    }
-
-    pub async fn resume(&mut self) -> Result<()> {
-        if self.state != VMState::Paused {
-            bail!("Can only resume a paused VM, got {:?}", self.state);
-        }
-        self.api_call("PATCH", "/vm", Some(json!({"state": "Resumed"})))
-            .await?;
-        self.state = VMState::Running;
         Ok(())
     }
 
@@ -323,7 +318,7 @@ impl FirecrackerVM {
         let vmstate_path = snap_dir.join("vmstate");
         let memory_path = snap_dir.join("memory");
 
-        self.api_call(
+        self.call_firecracker(
             "PUT",
             "/snapshot/create",
             Some(json!({
@@ -358,7 +353,7 @@ impl FirecrackerVM {
         vm.rootfs_path = snapshot.rootfs_path.clone();
         vm.spawn_process().await?;
 
-        vm.api_call(
+        vm.call_firecracker(
             "PUT",
             "/snapshot/load",
             Some(json!({
