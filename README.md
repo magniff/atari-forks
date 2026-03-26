@@ -1,24 +1,24 @@
 # Atari Forking Challenge
 
-A library for snapshotting and forking Firecracker microVMs, with a demo
-that performs tree search over an Atari Breakout environment.
+A Rust library for snapshotting and forking Firecracker microVMs, with a
+benchmark that performs tree search over an Atari Breakout environment.
 
-## What This Does
+## What this does
 
-Runs the Atari Breakout environment inside a Firecracker microVM, snapshots
-the VM state, forks it into 4 children (one per action), steps each child,
-selects a random successor, and repeats. Produces `1 + 4n` observation
-frames showing the game state diverging across different action sequences.
+Runs Atari Breakout inside a Firecracker microVM, snapshots the VM state,
+forks it into 4 children (one per legal action), steps each child in
+parallel, selects a random successor as the new root, and repeats.
+Produces `1 + 4n` observation frames.
 
 ```
      ┌──────────┐
      │  Root VM │  (Breakout, initial state)
      │  obs_0   │
      └────┬─────┘
-          │ snapshot
+          │ pause + diff snapshot
     ┌─────┼─────┬─────┐
     ▼     ▼     ▼     ▼
- NOOP   FIRE  RIGHT  LEFT     ← 4 children, each takes a different action
+ NOOP   FIRE  RIGHT  LEFT     ← 4 pre-warmed children, each takes a different action
  obs_1  obs_2  obs_3  obs_4
 
           │ randomly pick one
@@ -27,30 +27,31 @@ frames showing the game state diverging across different action sequences.
     ▼     ▼     ▼     ▼
 ```
 
-## Project Structure
+## Project structure
 
 ```
 atari-fork/
-├── firecracker_vm/          # Generic VM management library
-│   ├── __init__.py          #   Re-exports
-│   ├── vm.py                #   FirecrackerVM: single VM lifecycle
-│   ├── snapshot.py          #   Snapshot: captured VM state
-│   ├── pool.py              #   VMPool: parallel fork orchestration
-│   └── atari_client.py      #   Host-side vsock client for Atari agent
+├── src/
+│   ├── main.rs              # Benchmark entry point
+│   ├── vm.rs                # FirecrackerVM: single VM lifecycle
+│   ├── snapshot.rs          # Snapshot: captured VM state
+│   ├── pool.rs              # VMPool: fork orchestration + diff snapshots
+│   ├── process_pool.rs      # ProcessPool: pre-warmed FC processes
+│   └── atari_client.rs      # Host-side vsock client for the guest agent
 ├── guest/
-│   └── atari_agent.py       #   Guest-side agent (runs inside the VM)
-├── tree_search.py           #   Main benchmark script
-├── setup.sh                 #   Downloads Firecracker, kernel, builds rootfs
+│   └── atari_agent.py       # Guest-side agent (runs inside the VM as PID 1)
+├── setup.sh                 # Downloads Firecracker, kernel, builds rootfs
+├── Cargo.toml
 └── README.md
 ```
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
 - Linux with KVM support (`ls -la /dev/kvm`)
-- Python 3.10+
-- Docker (for rootfs building)
+- Rust toolchain (stable)
+- Docker (for rootfs building, or `debootstrap` + sudo)
 
 ### Setup
 
@@ -58,133 +59,172 @@ atari-fork/
 ./setup.sh
 ```
 
-This downloads:
+Downloads Firecracker v1.10.1, a Linux 6.1 guest kernel, and builds a
+Debian rootfs with Python, ALE, gymnasium, pillow, and numpy.
 
-- Firecracker v1.10.1
-- Linux kernel 6.1.102 (with `random.trust_cpu=on` support)
-- Builds a rootfs with Python, ALE, gymnasium, pillow, numpy
-
-### Run
+### Build and run
 
 ```bash
-python3 tree_search.py \
+cargo build --release
+
+./target/release/tree-search \
     --firecracker ./deps/firecracker \
     --kernel ./deps/vmlinux \
     --rootfs ./deps/rootfs.ext4 \
-    --iterations 10
+    --iterations 100 \
+    --pool-dir /dev/shm/vm-pool
 ```
-
-Produces 41 frames (`1 + 4×10`) in `./frames/`.
 
 ### Options
 
 ```
---iterations N    Number of fork-step-select cycles (default: 10)
---output DIR      Where to save frames (default: ./frames)
---vcpus N         vCPUs per VM (default: 1)
---mem N           Memory per VM in MiB (default: 256)
---seed N          Random seed for child selection (default: 42)
+--firecracker PATH   Path to Firecracker binary (default: firecracker)
+--kernel PATH        Path to guest kernel image
+--rootfs PATH        Path to rootfs ext4 image
+--iterations N       Number of fork-step-select cycles (default: 100)
+--output DIR         Where to save observation frames (default: ./frames)
+--vcpus N            vCPUs per VM (default: 1)
+--mem N              Guest memory in MiB (default: 128)
+--seed N             Random seed for child selection (default: 42)
+--pool-dir DIR       Work directory for snapshots and child VMs
+                     (default: ./vm-pool, recommend /dev/shm for tmpfs)
 ```
 
 ## Architecture
 
-### Library (`firecracker_vm/`)
+### Library layers
 
-Three layers, each with a single responsibility:
+**`FirecrackerVM`** (`vm.rs`) — Manages one Firecracker OS process.
+Handles boot (configure machine, kernel, rootfs, vsock, start), pause,
+snapshot creation (full or diff), and snapshot restore. Communicates
+with Firecracker over its Unix socket HTTP API using hyper.
 
-**`FirecrackerVM`** — Manages one Firecracker process. Handles boot,
-pause/resume, snapshot creation, and snapshot restore. Each instance maps
-to exactly one OS process. Uses relative vsock UDS paths so that restored
-VMs don't collide on the host-side socket.
+**`Snapshot`** (`snapshot.rs`) — A captured VM state: vmstate file +
+memory file + rootfs path + config. Immutable after creation — multiple
+children restore from the same snapshot concurrently via `MAP_PRIVATE`.
 
-**`Snapshot`** — Represents captured VM state (vmstate file + memory file).
-Immutable after creation — multiple VMs can restore from the same snapshot.
-Handles rootfs copying with reflink support for CoW filesystems.
+**`VMPool`** (`pool.rs`) — Orchestrates parallel fork operations with
+two key optimizations: diff snapshots that reuse a persistent base
+memory file (writing only dirty pages each iteration), and a process
+pool for pre-warmed Firecracker processes.
 
-**`VMPool`** — Orchestrates parallel fork operations. `fork(parent, n)`
-pauses the parent, snapshots it, and spawns n children in parallel.
+**`ProcessPool`** (`process_pool.rs`) — Maintains a buffer of
+pre-spawned Firecracker processes with their API sockets ready.
+Replenishes consumed slots in the background while the current
+iteration's children are stepping the environment.
+
+**`AtariClient`** (`atari_client.rs`) — Host-side client for the
+guest agent. Connects via Firecracker's vsock AF_UNIX proxy with a
+health-check probe to handle post-restore connection races.
 
 ### Communication
 
-The guest agent communicates with the host over **vsock** (virtio socket),
-which provides high-bandwidth virtio DMA transport. The host connects to
-Firecracker's AF_UNIX vsock proxy with a `CONNECT <port>\n` handshake.
+The guest agent (`atari_agent.py`) communicates over **virtio-vsock**
+(`AF_VSOCK`, `SOCK_STREAM`) — a reliable byte stream transported via
+virtio DMA ring buffers. Much faster than serial. The host connects
+through Firecracker's AF_UNIX vsock proxy with a `CONNECT <port>\n`
+handshake.
 
-The agent signals readiness by writing `AGENT_READY` to the serial console,
-which the host monitors on Firecracker's stdout.
+Protocol is newline-delimited JSON:
 
-### Guest Init
+```
+Host → Guest:  {"cmd": "reset"} | {"cmd": "step", "action": N} | {"cmd": "get_actions"}
+Guest → Host:  {"status": "ok", "obs": "<base64 png>", "reward": 0.0, "done": false}
+```
 
-The VM boots with `init=/opt/init.sh` — a 5-line script that mounts
-`/proc`, `/sys`, `/dev`, sets `PYTHONPATH`, and execs the agent directly
-as PID 1. No systemd, no init system.
+The agent signals readiness by writing `AGENT_READY` to `/dev/ttyS0`
+(serial console), which the host monitors on Firecracker's stdout pipe.
 
-### Key Design Decisions
+### Guest init
 
-- **Relative vsock `uds_path`**: The snapshot bakes the vsock path. Using
-  a relative path (`"v.sock"`) with per-VM `cwd` ensures restored children
-  don't collide on the host socket.
-- **`random.trust_cpu=on`**: Seeds the kernel entropy pool from RDRAND at
-  boot, preventing ALE from blocking on `/dev/random` in the headless VM.
-- **Kernel 6.1**: Required for the entropy fix (4.14 didn't support it).
-- **PNG over vsock**: Atari frames are 210×160 with flat color regions —
-  PNG compresses them to ~3-8KB, fast enough even for serial but instant
-  over vsock.
+The VM boots with `init=/opt/init.sh` — a minimal script that mounts
+`/proc`, `/sys`, `/dev`, `/tmp`, `/var`, sets `PYTHONPATH`, and execs
+the agent as PID 1. No systemd, no init system, no module loading.
 
-## How Forking Works
+### Key design decisions
+
+- **Relative vsock `uds_path`** (`"v.sock"`): The snapshot bakes the
+  vsock path. Using a relative path with per-VM `cwd` ensures restored
+  children don't collide on the host socket.
+- **`random.trust_cpu=on`**: Seeds the kernel entropy pool from RDRAND
+  at boot, preventing the guest from blocking on `/dev/random`.
+- **`mitigations=off`**: Disables Spectre/Meltdown mitigations in the
+  guest kernel — not needed for a benchmark workload, saves cycles.
+- **`MAP_PRIVATE` memory sharing**: Children restored from the same
+  snapshot share the same physical pages until they write. Each write
+  triggers a kernel CoW fault, giving each child its own copy of only
+  the pages it modifies.
+
+## How forking works
 
 Each iteration:
 
-1. **Pause** — `ioctl(KVM_PAUSE_VCPU)` freezes all vCPUs
-2. **Snapshot** — serialize CPU registers, device state, write dirty pages
-3. **Restore** — new process, `mmap(memory_file, MAP_PRIVATE)` for CoW,
-   restore KVM state. Each child gets copy-on-write memory pages.
-4. **Step** — each child takes a different action, producing a different
-   game frame
-5. **Select** — one child becomes the new root, others are destroyed
+1. **Pause** the parent VM (`PATCH /vm {"state": "Paused"}`)
+2. **Diff snapshot** — Firecracker writes only pages dirtied since the
+   last snapshot into the persistent base memory file (~1-2 MB vs 128 MB
+   for a full dump). Dirty page tracking via KVM's bitmap, reset after
+   each snapshot.
+3. **Take pre-warmed processes** from the process pool — 4 Firecracker
+   processes already spawned with API sockets ready
+4. **Load snapshot** into each process in parallel (`PUT /snapshot/load`)
+   — Firecracker mmaps the memory file with `MAP_PRIVATE`, sets up KVM
+   vCPU state, configures virtio devices
+5. **Step** each child over vsock — connect, health-check probe, send
+   action, receive observation
+6. **Select** one child as the new root, SIGKILL the rest, clean up
+   directories in a background thread
+
+The process pool replenishes in the background while step 5 executes,
+so fresh processes are ready before the next iteration's fork.
 
 ## Performance
 
-Typical numbers on a modern x86_64 machine:
+Typical numbers on a modern x86_64 machine with `--pool-dir /dev/shm/vm-pool`:
 
-- Boot + ALE init: ~500-600ms
-- Fork (4 children): ~400-700ms (dominated by rootfs copy)
-- Step all 4 children: ~15-25ms
-- Total per iteration: ~500-800ms
+| Metric                | Time        |
+| --------------------- | ----------- |
+| Boot + ALE init       | ~500-600 ms |
+| Fork (4 children)     | ~56 ms      |
+| Step all 4 (parallel) | ~6 ms       |
+| Total per iteration   | ~56 ms      |
+| 1000 iterations       | ~56 s       |
 
-### Optimization ideas
+### Optimizations applied
 
-- **btrfs/xfs reflinks** for rootfs copy — near-instant CoW
-- **Diff snapshots** with dirty page tracking — smaller memory files
-- **tmpfs** for snapshot files — avoid disk I/O
-- **Parallel steps** — step all children concurrently (currently sequential)
+| Optimization                                            | Effect                                    |
+| ------------------------------------------------------- | ----------------------------------------- |
+| `sync_file_range(SYNC_FILE_RANGE_WRITE)` after snapshot | Prevents dirty page accumulation stalls   |
+| Async filesystem cleanup via `spawn_blocking`           | Unlinks don't block the fork path         |
+| Early parent kill after fork                            | Frees MAP_PRIVATE mappings sooner         |
+| tmpfs (`/dev/shm`) for pool directory                   | Eliminates block I/O entirely             |
+| Diff snapshots with persistent base memory file         | ~1-2 MB written per snapshot vs 128 MB    |
+| Pre-warmed process pool with background replenishment   | Eliminates ~25 ms spawn overhead per fork |
+
+### Further optimization ideas
+
+- **Skip PNG encoding** in the guest — send raw RGB bytes over vsock,
+  encode on the host in Rust with the `png` crate
+- **Persistent HTTP connections** to Firecracker API — skip per-call
+  handshake overhead
+- **Custom VMM with `fork()`** — clone the VMM process directly, let
+  Linux CoW handle memory sharing without snapshot files at all
 
 ## Extending
 
-The `firecracker_vm` library is environment-agnostic:
+The VM management library is environment-agnostic. Replace
+`atari_client.rs` and `atari_agent.py` with your own guest agent and
+host client to fork arbitrary environments:
 
-```python
-from firecracker_vm import FirecrackerVM, VMConfig, VMPool
+```rust
+let mut vm = FirecrackerVM::new(config, None, "root")?;
+vm.boot().await?;
+// ... set up your environment ...
 
-config = VMConfig(
-    firecracker_bin="./firecracker",
-    kernel_path="./vmlinux",
-    rootfs_path="./my-rootfs.ext4",
-)
+let mut pool = VMPool::try_new(pool_dir, &config, num_children).await?;
 
-vm = FirecrackerVM(config)
-vm.boot()
+let fork_result = pool.fork(&mut vm, num_children).await?;
+// fork_result.children: Vec<FirecrackerVM>, each restored from the same state
 
-pool = VMPool(base_dir="/tmp/pool")
-result = pool.fork(vm, num_children=3)
-
-# Each child is a full VM restored from the same point
-for child in result.children:
-    pass  # do work
-
-selected = pool.select_and_cleanup(result, selected_index=1)
+let selected = pool.select_and_cleanup(fork_result, chosen_index);
+// selected is now the new root VM for the next iteration
 ```
-
-## License
-
-MIT
