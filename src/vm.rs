@@ -405,6 +405,15 @@ Accept: application/json\r\n\
         self.process.as_mut().and_then(|p| p.stdout.take())
     }
 
+    /// Send SIGKILL but don't wait for exit. Fast — just a syscall.
+    /// The process will be reaped later by destroy() or Drop.
+    pub fn kill_no_wait(&mut self) {
+        if let Some(ref mut child) = self.process {
+            let _ = child.kill();
+        }
+        self.state = VMState::Stopped;
+    }
+
     pub fn destroy(&mut self) {
         if let Some(mut child) = self.process.take() {
             let _ = child.kill();

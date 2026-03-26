@@ -148,13 +148,19 @@ fn main() -> Result<()> {
 
     let mut current_vm = root_vm;
 
-    // Background cleanup — destroy old VMs off the hot path
-    let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel::<FirecrackerVM>();
+    // Background cleanup — waitpid + remove directories
+    let (cleanup_tx, cleanup_rx) =
+        std::sync::mpsc::channel::<(FirecrackerVM, Vec<FirecrackerVM>)>();
     let _cleanup_thread = std::thread::spawn(move || {
-        for mut vm in cleanup_rx {
-            let dir = vm.work_dir.clone();
-            vm.destroy();
-            let _ = std::fs::remove_dir_all(&dir);
+        for (mut parent, children) in cleanup_rx {
+            let parent_dir = parent.work_dir.clone();
+            parent.destroy();
+            let _ = std::fs::remove_dir_all(&parent_dir);
+            for mut child in children {
+                let dir = child.work_dir.clone();
+                child.destroy(); // waitpid happens here
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     });
 
@@ -219,6 +225,7 @@ fn main() -> Result<()> {
         let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
 
         // Record results
+        let t_record = Instant::now();
         let mut child_rewards = Vec::new();
         for (action, result) in &step_results {
             child_rewards.push(result.reward);
@@ -239,6 +246,7 @@ fn main() -> Result<()> {
             );
             frame_count += 1;
         }
+        let record_ms = t_record.elapsed().as_secs_f64() * 1000.0;
 
         // Select random child
         let selected_idx = rng.gen_range(0..num_actions);
@@ -249,27 +257,30 @@ fn main() -> Result<()> {
         current_rewards.push(selected_reward);
 
         // Select child, send everything else to background cleanup
+        let t_cleanup = Instant::now();
         let (selected, discarded, snapshot) = pool.select(fork_result, selected_idx);
         let old_vm = std::mem::replace(&mut current_vm, selected);
-        // Kill discarded children synchronously — they hold MAP_PRIVATE
-        // mmaps of the snapshot memory file on /dev/shm. Must die before
-        // the next snapshot or tmpfs fills up.
-        for mut child in discarded {
-            child.destroy();
-            let _ = std::fs::remove_dir_all(&child.work_dir);
+        // SIGKILL all discarded children immediately (just a syscall, no wait).
+        // This releases their MAP_PRIVATE mmaps so tmpfs pages are freed.
+        let mut dead_children: Vec<FirecrackerVM> = discarded;
+        for child in &mut dead_children {
+            child.kill_no_wait();
         }
-        // Delete snapshot files now that children are dead
+        // Snapshot files can go now that children are killed
         snapshot.cleanup();
-        // Old parent can die in the background — it's just one VM
-        let _ = cleanup_tx.send(old_vm);
+        // Defer waitpid + directory removal to background
+        let _ = cleanup_tx.send((old_vm, dead_children));
+        let cleanup_ms = t_cleanup.elapsed().as_secs_f64() * 1000.0;
 
         let iter_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
         println!(
-            "Iter {}/{}: fork={:.1}ms step={:.1}ms total={:.1}ms",
+            "Iter {}/{}: fork={:.1}ms step={:.1}ms rec={:.1}ms clean={:.1}ms total={:.1}ms",
             iteration + 1,
             args.iterations,
             fork_ms,
             step_ms,
+            record_ms,
+            cleanup_ms,
             iter_ms
         );
 
