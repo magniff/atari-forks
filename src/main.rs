@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use rand::Rng;
+use rand::SeedableRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -400,5 +401,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-use rand::SeedableRng;

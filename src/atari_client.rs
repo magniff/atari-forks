@@ -6,7 +6,6 @@ use std::path::Path;
 use std::time::Duration;
 
 const VSOCK_GUEST_PORT: u16 = 5005;
-const AGENT_READY_SENTINEL: &str = "AGENT_READY";
 
 /// Host-side client for the Atari guest agent.
 ///
@@ -17,46 +16,6 @@ pub struct AtariClient {
 }
 
 impl AtariClient {
-    /// Wait for AGENT_READY on serial, then connect via vsock.
-    ///
-    /// `serial_stdout` is an iterator over lines from Firecracker's stdout.
-    /// For restored VMs, pass `skip_ready = true` to skip the serial wait.
-    pub fn connect(
-        vsock_uds_path: &Path,
-        serial_stdout: &mut Option<impl BufRead>,
-        skip_ready: bool,
-        timeout: Duration,
-    ) -> Result<Self> {
-        if !skip_ready {
-            // Watch serial for AGENT_READY
-            if let Some(reader) = serial_stdout.as_mut() {
-                let deadline = std::time::Instant::now() + timeout;
-                let mut line = String::new();
-                loop {
-                    if std::time::Instant::now() > deadline {
-                        bail!("Guest agent did not send AGENT_READY within {:?}", timeout);
-                    }
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => bail!("EOF on serial before AGENT_READY"),
-                        Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {}
-                            if line.contains(AGENT_READY_SENTINEL) {
-                                break;
-                            }
-                        }
-                        Err(e) => bail!("Error reading serial: {e}"),
-                    }
-                }
-            } else {
-            }
-        }
-
-        let stream = Self::do_connect_vsock(vsock_uds_path, timeout)?;
-        Ok(Self { stream })
-    }
-
     pub fn connect_vsock(uds_path: &Path, timeout: Duration) -> Result<Self> {
         let stream = Self::do_connect_vsock(uds_path, timeout)?;
         Ok(Self { stream })
@@ -106,7 +65,7 @@ impl AtariClient {
             .context("read response from guest")?;
 
         if bytes_read == 0 {
-            bail!("Guest disconnected (EOF) — VM may have crashed or been killed");
+            bail!("The vm has exited");
         }
 
         let response: Value = serde_json::from_str(line.trim())

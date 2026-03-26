@@ -1,17 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::snapshot::Snapshot;
 use crate::vm::{FirecrackerVM, VMConfig};
-
-pub struct ForkResult {
-    pub children: Vec<FirecrackerVM>,
-    pub snapshot: Snapshot,
-    pub fork_time_ms: f64,
-}
 
 /// VM pool with background pre-spawning of Firecracker processes.
 ///
@@ -19,12 +12,7 @@ pub struct ForkResult {
 /// A background thread replenishes the pool as VMs are consumed. At fork
 /// time, we just load the snapshot into pre-spawned processes — no fork+exec.
 pub struct VMPool {
-    pub base_dir: PathBuf,
-    pool_size: usize,
-    fork_counter: AtomicU64,
-    dir_counter: Arc<AtomicU64>,
     warm_pool: Arc<Mutex<Vec<FirecrackerVM>>>,
-    config: VMConfig,
     shutdown: Arc<AtomicBool>,
     _replenish_handle: Option<thread::JoinHandle<()>>,
 }
@@ -63,12 +51,7 @@ impl VMPool {
         });
 
         Ok(Self {
-            base_dir,
-            pool_size,
-            fork_counter: AtomicU64::new(0),
-            dir_counter,
             warm_pool,
-            config,
             shutdown,
             _replenish_handle: Some(handle),
         })
@@ -118,93 +101,6 @@ impl VMPool {
             // Not enough ready — spin briefly, the background thread is spawning
             thread::sleep(std::time::Duration::from_millis(1));
         }
-    }
-
-    /// Fork a running VM into multiple children.
-    pub fn fork(&self, parent: &mut FirecrackerVM, num_children: usize) -> Result<ForkResult> {
-        let t0 = std::time::Instant::now();
-        let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Pause
-        let tp = std::time::Instant::now();
-        parent.pause()?;
-        let pause_us = tp.elapsed().as_micros();
-
-        // Snapshot
-        let ts = std::time::Instant::now();
-        let shm_base = std::path::Path::new("/dev/shm");
-        let snap_dir = if shm_base.exists() {
-            shm_base.join(format!("atari-fork-snap-{fork_id}"))
-        } else {
-            self.base_dir.join(format!("snap-{fork_id}"))
-        };
-        let snapshot = parent.create_snapshot(&snap_dir)?;
-        let snap_us = ts.elapsed().as_micros();
-
-        // Take warm VMs
-        let tw = std::time::Instant::now();
-        let idle_vms = self.take_warm(num_children);
-        let warm_us = tw.elapsed().as_micros();
-
-        // Load snapshot in parallel
-        let tl = std::time::Instant::now();
-        let handles: Vec<_> = idle_vms
-            .into_iter()
-            .map(|mut vm| {
-                let snap = snapshot.clone();
-                thread::spawn(move || -> Result<FirecrackerVM> {
-                    vm.load_snapshot(&snap, true)?;
-                    Ok(vm)
-                })
-            })
-            .collect();
-
-        let mut children = Vec::with_capacity(num_children);
-        let mut errors = Vec::new();
-        for (i, h) in handles.into_iter().enumerate() {
-            match h.join() {
-                Ok(Ok(vm)) => children.push(vm),
-                Ok(Err(e)) => errors.push((i, e)),
-                Err(_) => errors.push((i, anyhow::anyhow!("thread panicked"))),
-            }
-        }
-        let load_us = tl.elapsed().as_micros();
-
-        if fork_id % 50 == 1 {
-            eprintln!(
-                "[fork] pause={}us snap={}us warm={}us load={}us",
-                pause_us, snap_us, warm_us, load_us
-            );
-        }
-
-        if !errors.is_empty() {
-            for mut c in children {
-                c.destroy();
-            }
-            let msg: Vec<_> = errors
-                .iter()
-                .map(|(i, e)| format!("child {i}: {e}"))
-                .collect();
-            bail!("Failed: {}", msg.join(", "));
-        }
-
-        Ok(ForkResult {
-            children,
-            snapshot,
-            fork_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        })
-    }
-
-    /// Extract the selected child. Returns (selected, discarded_children, snapshot).
-    /// Caller is responsible for destroying the discarded children and snapshot
-    /// (e.g. in a background thread).
-    pub fn select(
-        &self,
-        mut result: ForkResult,
-        selected_index: usize,
-    ) -> (FirecrackerVM, Vec<FirecrackerVM>, Snapshot) {
-        let selected = result.children.remove(selected_index);
-        (selected, result.children, result.snapshot)
     }
 }
 

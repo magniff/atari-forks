@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -303,15 +303,6 @@ Accept: application/json\r\n\
         Ok(())
     }
 
-    pub fn resume(&mut self) -> Result<()> {
-        if self.state != VMState::Paused {
-            bail!("Can only resume a paused VM, got {:?}", self.state);
-        }
-        self.api_call("PATCH", "/vm", Some(json!({"state": "Resumed"})))?;
-        self.state = VMState::Running;
-        Ok(())
-    }
-
     pub fn create_snapshot(&self, snapshot_dir: &Path) -> Result<Snapshot> {
         if self.state != VMState::Paused {
             bail!("VM must be paused before snapshotting");
@@ -337,21 +328,6 @@ Accept: application/json\r\n\
             rootfs_path: self.rootfs_path.clone(),
             config: self.config.clone(),
         })
-    }
-
-    /// Restore a VM from a snapshot.
-    pub fn restore_from_snapshot(
-        snapshot: &Snapshot,
-        work_dir: PathBuf,
-        vm_id: &str,
-        rootfs_path: Option<PathBuf>,
-        resume: bool,
-    ) -> Result<Self> {
-        let mut vm = Self::new(snapshot.config.clone(), Some(work_dir), vm_id)?;
-        vm.rootfs_path = rootfs_path.unwrap_or_else(|| snapshot.rootfs_path.clone());
-        vm.spawn_process()?;
-        vm.load_snapshot(snapshot, resume)?;
-        Ok(vm)
     }
 
     /// Create a VM with a spawned Firecracker process, ready for snapshot load.
@@ -389,14 +365,6 @@ Accept: application/json\r\n\
     /// Get the absolute path to the vsock UDS.
     pub fn vsock_uds_path(&self) -> PathBuf {
         self.work_dir.join("v.sock")
-    }
-
-    /// Get a handle to the process's stdout (serial console).
-    pub fn serial_stdout(&mut self) -> Option<impl BufRead + '_> {
-        self.process
-            .as_mut()
-            .and_then(|p| p.stdout.take())
-            .map(BufReader::new)
     }
 
     /// Take ownership of the process's stdout handle.
