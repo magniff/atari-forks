@@ -211,10 +211,13 @@ RUN chmod +x /usr/local/bin/atari_agent.py
 
 # Create a minimal init script.
 # Sets PYTHONPATH so pip-installed packages in /usr/local are found.
+# Mounts tmpfs on /tmp and /var so the rootfs can be read-only.
 RUN printf '#!/bin/sh\n\
 mount -t proc proc /proc\n\
 mount -t sysfs sys /sys\n\
 mount -t devtmpfs dev /dev\n\
+mount -t tmpfs tmpfs /tmp\n\
+mount -t tmpfs tmpfs /var\n\
 export PYTHONPATH=/usr/local/lib/python3.11/dist-packages\n\
 exec /usr/bin/python3 /usr/local/bin/atari_agent.py\n' > /opt/init.sh && \
     chmod +x /opt/init.sh
@@ -335,6 +338,8 @@ build_rootfs_chroot() {
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /var
 export PYTHONPATH=/usr/local/lib/python3.11/dist-packages
 exec /usr/bin/python3 /usr/local/bin/atari_agent.py
 INITEOF

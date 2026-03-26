@@ -1,116 +1,75 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 const VSOCK_GUEST_PORT: u16 = 5005;
-const AGENT_READY_SENTINEL: &str = "AGENT_READY";
 
 /// Host-side client for the Atari guest agent.
 ///
-/// Connects via Firecracker's vsock AF_UNIX proxy. Watches serial
-/// (Firecracker stdout) for AGENT_READY before connecting.
+/// Connects via Firecracker's vsock AF_UNIX proxy. Uses a persistent
+/// BufReader to avoid losing data when the guest sends responses
+/// faster than we read them (the old code created a new BufReader per
+/// call, silently dropping any buffered bytes).
 pub struct AtariClient {
-    stream: UnixStream,
+    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
+    writer: tokio::io::WriteHalf<UnixStream>,
 }
 
 impl AtariClient {
-    /// Wait for AGENT_READY on serial, then connect via vsock.
+    /// Connect to the guest agent via the vsock Unix socket.
     ///
-    /// `serial_stdout` is an iterator over lines from Firecracker's stdout.
-    /// For restored VMs, pass `skip_ready = true` to skip the serial wait.
-    pub fn connect(
-        vsock_uds_path: &Path,
-        serial_stdout: &mut Option<impl BufRead>,
-        skip_ready: bool,
-        timeout: Duration,
-    ) -> Result<Self> {
-        if !skip_ready {
-            // Watch serial for AGENT_READY
-            if let Some(reader) = serial_stdout.as_mut() {
-                eprintln!("[debug] Waiting for AGENT_READY on serial...");
-                let deadline = std::time::Instant::now() + timeout;
-                let mut line = String::new();
-                loop {
-                    if std::time::Instant::now() > deadline {
-                        bail!("Guest agent did not send AGENT_READY within {:?}", timeout);
-                    }
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => bail!("EOF on serial before AGENT_READY"),
-                        Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                eprintln!("[debug] serial: {}", &trimmed[..trimmed.len().min(100)]);
-                            }
-                            if line.contains(AGENT_READY_SENTINEL) {
-                                eprintln!("[debug] Got AGENT_READY!");
-                                break;
-                            }
-                        }
-                        Err(e) => bail!("Error reading serial: {e}"),
-                    }
-                }
-            } else {
-                eprintln!("[debug] No serial handle, skipping AGENT_READY wait");
-            }
-        }
-
-        eprintln!("[debug] Connecting to vsock at {:?}...", vsock_uds_path);
-        let stream = Self::do_connect_vsock(vsock_uds_path, timeout)?;
-        eprintln!("[debug] Vsock connected!");
-        Ok(Self { stream })
-    }
-
-    pub fn connect_vsock(uds_path: &Path, timeout: Duration) -> Result<Self> {
-        let stream = Self::do_connect_vsock(uds_path, timeout)?;
-        Ok(Self { stream })
-    }
-
-    fn do_connect_vsock(uds_path: &Path, timeout: Duration) -> Result<UnixStream> {
-        let deadline = std::time::Instant::now() + timeout;
+    /// Performs the Firecracker vsock handshake (CONNECT <port>\n → OK\n),
+    /// then returns a client ready for JSON-line commands.
+    pub async fn connect(vsock_uds_path: &Path, timeout: Duration) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            match UnixStream::connect(uds_path) {
-                Ok(mut sock) => {
-                    sock.set_read_timeout(Some(Duration::from_secs(30)))?;
-                    sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+            if let Ok(stream) = UnixStream::connect(vsock_uds_path).await {
+                // Firecracker vsock handshake
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half);
 
-                    // Firecracker vsock handshake: CONNECT <port>\n -> OK <port>\n
-                    let cmd = format!("CONNECT {VSOCK_GUEST_PORT}\n");
-                    sock.write_all(cmd.as_bytes())?;
+                let cmd = format!("CONNECT {VSOCK_GUEST_PORT}\n");
+                write_half.write_all(cmd.as_bytes()).await?;
 
-                    let mut response = String::new();
-                    let mut reader = BufReader::new(&sock);
-                    reader.read_line(&mut response)?;
+                let mut response = String::new();
+                reader.read_line(&mut response).await?;
 
-                    if response.starts_with("OK") {
-                        // Reconstruct the stream from the reader
-                        drop(reader);
-                        return Ok(sock);
-                    }
+                if response.starts_with("OK") {
+                    return Ok(Self {
+                        reader,
+                        writer: write_half,
+                    });
                 }
-                Err(_) => {}
             }
 
-            if std::time::Instant::now() > deadline {
-                bail!("Could not connect to guest via vsock at {:?}", uds_path);
+            if tokio::time::Instant::now() > deadline {
+                bail!(
+                    "Could not connect to guest via vsock at {:?}",
+                    vsock_uds_path
+                );
             }
-            std::thread::sleep(Duration::from_millis(300));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
-    fn send_command(&mut self, cmd: &Value) -> Result<Value> {
+    /// Send a JSON command and read a JSON response (newline-delimited).
+    async fn send_command(&mut self, cmd: &Value) -> Result<Value> {
         let msg = format!("{}\n", cmd);
-        self.stream.write_all(msg.as_bytes())?;
+        self.writer.write_all(msg.as_bytes()).await?;
 
-        let mut reader = BufReader::new(&self.stream);
         let mut line = String::new();
-        reader
+        let n = self
+            .reader
             .read_line(&mut line)
+            .await
             .context("read response from guest")?;
+        if n == 0 {
+            bail!("EOF from guest agent");
+        }
 
         let response: Value = serde_json::from_str(line.trim()).context("parse guest response")?;
 
@@ -125,26 +84,28 @@ impl AtariClient {
         Ok(response)
     }
 
-    pub fn reset(&mut self) -> Result<Vec<u8>> {
-        let resp = self.send_command(&serde_json::json!({"cmd": "reset"}))?;
-        let obs_b64 = resp["obs"].as_str().context("missing obs field")?;
-        let obs = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, obs_b64)?;
-        Ok(obs)
+    pub async fn reset(&mut self) -> Result<Vec<u8>> {
+        let resp = self
+            .send_command(&serde_json::json!({"cmd": "reset"}))
+            .await?;
+        decode_obs(&resp)
     }
 
-    pub fn step(&mut self, action: i64) -> Result<StepResult> {
-        let resp = self.send_command(&serde_json::json!({"cmd": "step", "action": action}))?;
-        let obs_b64 = resp["obs"].as_str().context("missing obs")?;
-        let obs = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, obs_b64)?;
+    pub async fn step(&mut self, action: i64) -> Result<StepResult> {
+        let resp = self
+            .send_command(&serde_json::json!({"cmd": "step", "action": action}))
+            .await?;
         Ok(StepResult {
-            obs,
+            obs: decode_obs(&resp)?,
             reward: resp["reward"].as_f64().unwrap_or(0.0),
             done: resp["done"].as_bool().unwrap_or(false),
         })
     }
 
-    pub fn get_legal_actions(&mut self) -> Result<Vec<i64>> {
-        let resp = self.send_command(&serde_json::json!({"cmd": "get_actions"}))?;
+    pub async fn get_legal_actions(&mut self) -> Result<Vec<i64>> {
+        let resp = self
+            .send_command(&serde_json::json!({"cmd": "get_actions"}))
+            .await?;
         let actions = resp["actions"]
             .as_array()
             .context("missing actions")?
@@ -153,6 +114,12 @@ impl AtariClient {
             .collect();
         Ok(actions)
     }
+}
+
+fn decode_obs(resp: &Value) -> Result<Vec<u8>> {
+    let obs_b64 = resp["obs"].as_str().context("missing obs field")?;
+    let obs = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, obs_b64)?;
+    Ok(obs)
 }
 
 pub struct StepResult {

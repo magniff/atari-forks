@@ -1,9 +1,14 @@
 use anyhow::{bail, Context, Result};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
 
 use crate::snapshot::Snapshot;
 
@@ -47,7 +52,7 @@ impl Default for VMConfig {
 /// Manages a single Firecracker microVM process.
 ///
 /// Each instance owns one Firecracker OS process and communicates
-/// with it over a Unix domain socket (REST API).
+/// with it over a Unix domain socket (HTTP API via hyper).
 pub struct FirecrackerVM {
     pub config: VMConfig,
     pub vm_id: String,
@@ -62,18 +67,16 @@ pub struct FirecrackerVM {
 impl FirecrackerVM {
     pub fn new(config: VMConfig, work_dir: Option<PathBuf>, vm_id: &str) -> Result<Self> {
         let work_dir = match work_dir {
-            Some(d) => std::fs::canonicalize(&d)
-                .or_else(|_| {
-                    std::fs::create_dir_all(&d)?;
-                    std::fs::canonicalize(&d)
-                })
-                .context("canonicalize work_dir")?,
+            Some(d) => {
+                std::fs::create_dir_all(&d)?;
+                std::fs::canonicalize(&d).context("canonicalize work_dir")?
+            }
             None => {
                 let td = tempfile::Builder::new()
                     .prefix(&format!("fc-{}-", vm_id))
                     .tempdir()?;
                 let d = td.path().to_path_buf();
-                std::mem::forget(td); // prevent cleanup on drop
+                std::mem::forget(td);
                 d
             }
         };
@@ -94,18 +97,17 @@ impl FirecrackerVM {
     }
 
     /// Full boot: spawn process, configure, start.
-    pub fn boot(&mut self) -> Result<()> {
-        self.spawn_process()?;
-        self.configure_machine()?;
-        self.configure_boot_source()?;
-        self.configure_rootfs()?;
-        self.configure_vsock()?;
-        self.start_instance()?;
+    pub async fn boot(&mut self) -> Result<()> {
+        self.spawn_process().await?;
+        self.configure_machine().await?;
+        self.configure_boot_source().await?;
+        self.configure_rootfs().await?;
+        self.configure_vsock().await?;
+        self.start_instance().await?;
         Ok(())
     }
 
-    fn spawn_process(&mut self) -> Result<()> {
-        // Clean up stale socket
+    async fn spawn_process(&mut self) -> Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
 
         let fc_bin = std::fs::canonicalize(&self.config.firecracker_bin)
@@ -124,110 +126,80 @@ impl FirecrackerVM {
 
         self.process = Some(child);
 
-        // Wait for socket to become available
-        for _ in 0..100 {
+        // Wait for API socket to become available
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
             if self.socket_path.exists() {
-                if self.api_call("GET", "/", None).is_ok() {
+                if self.api_call("GET", "/", None).await.is_ok() {
                     return Ok(());
                 }
             }
-            std::thread::sleep(Duration::from_millis(100));
+            if tokio::time::Instant::now() > deadline {
+                bail!("Firecracker failed to start. Check {:?}", self.log_path);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        bail!("Firecracker failed to start. Check {:?}", self.log_path)
     }
 
     /// Make an HTTP request to the Firecracker API over the Unix socket.
-    fn api_call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
-        use std::io::{BufRead, BufReader, Read, Write as _};
-        use std::os::unix::net::UnixStream;
+    ///
+    /// Opens a fresh connection per call. Firecracker's API is
+    /// single-threaded and low-frequency — connection reuse isn't
+    /// worth the complexity of keeping an idle connection alive.
+    async fn api_call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .context("connect to API socket")?;
+        let io = TokioIo::new(stream);
 
-        let stream = UnixStream::connect(&self.socket_path).context("connect to API socket")?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("HTTP handshake")?;
 
-        let body_str = body.map(|b| b.to_string());
-        let cl = body_str.as_ref().map(|b| b.len()).unwrap_or(0);
+        // Drive the connection in the background.
+        // The spawned task exits when the response is fully read
+        // and `sender` is dropped.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("[api] connection error: {e}");
+            }
+        });
 
-        let request = if let Some(ref b) = body_str {
-            format!(
-                "{method} {path} HTTP/1.1\r\n\
-Host: localhost\r\n\
-Accept: application/json\r\n\
-Content-Type: application/json\r\n\
-Content-Length: {cl}\r\n\
-\r\n{b}"
-            )
-        } else {
-            format!(
-                "{method} {path} HTTP/1.1\r\n\
-Host: localhost\r\n\
-Accept: application/json\r\n\
-\r\n"
-            )
+        let body_bytes = match &body {
+            Some(v) => v.to_string().into_bytes(),
+            None => Vec::new(),
         };
 
-        (&stream).write_all(request.as_bytes())?;
-        eprintln!(
-            "[api] {} {} ({} bytes): {:?}",
-            method,
-            path,
-            request.len(),
-            &request[..request.len().min(200)]
-        );
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "localhost")
+            .header("Accept", "application/json");
 
-        let mut reader = BufReader::new(&stream);
-
-        // Read status line
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line)?;
-        let status_code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Read headers, extract Content-Length
-        let mut content_length: usize = 0;
-        loop {
-            let mut header = String::new();
-            reader.read_line(&mut header)?;
-            let trimmed = header.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-                content_length = val.trim().parse().unwrap_or(0);
-            }
-            // Also check lowercase
-            if let Some(val) = trimmed.strip_prefix("content-length:") {
-                content_length = val.trim().parse().unwrap_or(0);
-            }
+        if body.is_some() {
+            builder = builder
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body_bytes.len());
         }
 
-        // Read exactly content_length bytes of body
-        let body_text = if content_length > 0 {
-            let mut buf = vec![0u8; content_length];
-            reader.read_exact(&mut buf)?;
-            String::from_utf8_lossy(&buf).to_string()
-        } else {
-            String::new()
-        };
+        let req = builder
+            .body(Full::new(Bytes::from(body_bytes)))
+            .context("build request")?;
 
-        // Explicitly close the connection
-        drop(reader);
-        drop(stream);
+        let response = sender.send_request(req).await.context("send request")?;
+        let status = response.status();
+        let resp_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .context("read response body")?
+            .to_bytes();
+        let body_text = String::from_utf8_lossy(&resp_bytes);
 
-        eprintln!(
-            "[api] {} {} -> {} (body: {} bytes)",
-            method,
-            path,
-            status_code,
-            body_text.len()
-        );
-
-        if status_code >= 400 {
+        if status.as_u16() >= 400 {
             bail!(
                 "Firecracker API error {} on {} {}: {}",
-                status_code,
+                status.as_u16(),
                 method,
                 path,
                 body_text.trim()
@@ -241,7 +213,7 @@ Accept: application/json\r\n\
         }
     }
 
-    fn configure_machine(&self) -> Result<()> {
+    async fn configure_machine(&self) -> Result<()> {
         self.api_call(
             "PUT",
             "/machine-config",
@@ -250,11 +222,12 @@ Accept: application/json\r\n\
                 "mem_size_mib": self.config.mem_size_mib,
                 "track_dirty_pages": self.config.track_dirty,
             })),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn configure_boot_source(&self) -> Result<()> {
+    async fn configure_boot_source(&self) -> Result<()> {
         let kernel = std::fs::canonicalize(&self.config.kernel_path)?;
         self.api_call(
             "PUT",
@@ -263,27 +236,27 @@ Accept: application/json\r\n\
                 "kernel_image_path": kernel.to_str().unwrap(),
                 "boot_args": self.config.boot_args,
             })),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn configure_rootfs(&self) -> Result<()> {
-        let rootfs = std::fs::canonicalize(&self.config.rootfs_path)?;
+    async fn configure_rootfs(&self) -> Result<()> {
         self.api_call(
             "PUT",
             "/drives/rootfs",
             Some(json!({
                 "drive_id": "rootfs",
-                "path_on_host": rootfs.to_str().unwrap(),
+                "path_on_host": self.rootfs_path.to_str().unwrap(),
                 "is_root_device": true,
-                "is_read_only": false,
+                "is_read_only": true,
             })),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn configure_vsock(&self) -> Result<()> {
-        // Relative path — each VM's cwd makes it unique
+    async fn configure_vsock(&self) -> Result<()> {
         self.api_call(
             "PUT",
             "/vsock",
@@ -292,46 +265,50 @@ Accept: application/json\r\n\
                 "guest_cid": 3,
                 "uds_path": "v.sock",
             })),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn start_instance(&mut self) -> Result<()> {
+    async fn start_instance(&mut self) -> Result<()> {
         self.api_call(
             "PUT",
             "/actions",
             Some(json!({
                 "action_type": "InstanceStart",
             })),
-        )?;
+        )
+        .await?;
         self.state = VMState::Running;
         Ok(())
     }
 
-    pub fn pause(&mut self) -> Result<()> {
+    pub async fn pause(&mut self) -> Result<()> {
         if self.state != VMState::Running {
             bail!("Can only pause a running VM, got {:?}", self.state);
         }
-        self.api_call("PATCH", "/vm", Some(json!({"state": "Paused"})))?;
+        self.api_call("PATCH", "/vm", Some(json!({"state": "Paused"})))
+            .await?;
         self.state = VMState::Paused;
         Ok(())
     }
 
-    pub fn resume(&mut self) -> Result<()> {
+    pub async fn resume(&mut self) -> Result<()> {
         if self.state != VMState::Paused {
             bail!("Can only resume a paused VM, got {:?}", self.state);
         }
-        self.api_call("PATCH", "/vm", Some(json!({"state": "Resumed"})))?;
+        self.api_call("PATCH", "/vm", Some(json!({"state": "Resumed"})))
+            .await?;
         self.state = VMState::Running;
         Ok(())
     }
 
-    pub fn create_snapshot(&self, snapshot_dir: &Path) -> Result<Snapshot> {
+    pub async fn create_snapshot(&self, snapshot_dir: &Path) -> Result<Snapshot> {
         if self.state != VMState::Paused {
             bail!("VM must be paused before snapshotting");
         }
-        let snap_dir =
-            std::fs::canonicalize(std::fs::create_dir_all(snapshot_dir).map(|_| snapshot_dir)?)?;
+        std::fs::create_dir_all(snapshot_dir)?;
+        let snap_dir = std::fs::canonicalize(snapshot_dir)?;
         let vmstate_path = snap_dir.join("vmstate");
         let memory_path = snap_dir.join("memory");
 
@@ -343,7 +320,8 @@ Accept: application/json\r\n\
                 "snapshot_path": vmstate_path.to_str().unwrap(),
                 "mem_file_path": memory_path.to_str().unwrap(),
             })),
-        )?;
+        )
+        .await?;
 
         Ok(Snapshot {
             vmstate_path,
@@ -354,16 +332,20 @@ Accept: application/json\r\n\
     }
 
     /// Restore a VM from a snapshot.
-    pub fn restore_from_snapshot(
+    ///
+    /// The rootfs is shared read-only across all children — no copy
+    /// needed. Memory is loaded via MAP_PRIVATE by Firecracker, so
+    /// each restored VM gets its own CoW pages backed by the same
+    /// snapshot file on disk.
+    pub async fn restore_from_snapshot(
         snapshot: &Snapshot,
         work_dir: PathBuf,
         vm_id: &str,
-        rootfs_path: Option<PathBuf>,
         resume: bool,
     ) -> Result<Self> {
         let mut vm = Self::new(snapshot.config.clone(), Some(work_dir), vm_id)?;
-        vm.rootfs_path = rootfs_path.unwrap_or_else(|| snapshot.rootfs_path.clone());
-        vm.spawn_process()?;
+        vm.rootfs_path = snapshot.rootfs_path.clone();
+        vm.spawn_process().await?;
 
         vm.api_call(
             "PUT",
@@ -377,7 +359,8 @@ Accept: application/json\r\n\
                 "enable_diff_snapshots": snapshot.config.track_dirty,
                 "resume_vm": resume,
             })),
-        )?;
+        )
+        .await?;
 
         vm.state = if resume {
             VMState::Running
@@ -387,29 +370,23 @@ Accept: application/json\r\n\
         Ok(vm)
     }
 
-    /// Get the absolute path to the vsock UDS.
+    /// Absolute path to the vsock UDS.
     pub fn vsock_uds_path(&self) -> PathBuf {
         self.work_dir.join("v.sock")
     }
 
-    /// Get a handle to the process's stdout (serial console).
-    pub fn serial_stdout(&mut self) -> Option<impl BufRead + '_> {
-        self.process
-            .as_mut()
-            .and_then(|p| p.stdout.take())
-            .map(BufReader::new)
-    }
-
-    /// Take ownership of the process's stdout handle.
-    /// Unlike serial_stdout(), returns the raw ChildStdout without BufReader wrapping.
-    pub fn process_stdout(&mut self) -> Option<std::process::ChildStdout> {
+    /// Take ownership of the process's stdout handle (serial console).
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.process.as_mut().and_then(|p| p.stdout.take())
     }
 
+    /// Kill the Firecracker process and clean up the socket file.
     pub fn destroy(&mut self) {
         if let Some(mut child) = self.process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // start_kill() sends SIGKILL — non-async, just a syscall.
+            let _ = child.start_kill();
+            // The Child is dropped here; tokio reaps the zombie via
+            // a background SIGCHLD handler.
         }
         self.state = VMState::Stopped;
         let _ = std::fs::remove_file(&self.socket_path);
