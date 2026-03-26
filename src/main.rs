@@ -43,7 +43,7 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    #[arg(long, default_value = "/dev/shm/vm-pool")]
+    #[arg(long)]
     pool_dir: Option<PathBuf>,
 }
 
@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(frames_dir)?;
 
     // ── Set up pool directory (optionally on tmpfs) ─────────────────
+
     let pool_dir = args
         .pool_dir
         .unwrap_or_else(|| frames_dir.parent().unwrap_or(frames_dir).join("vm-pool"));
@@ -121,16 +122,14 @@ async fn main() -> Result<()> {
 
     let mut frame_count = 0usize;
 
-    println!(
-        "Starting tree search: {iterations} iterations",
-        iterations = args.iterations
-    );
-    println!("Guest memory: {mem}MB", mem = args.mem);
-    println!("Output directory: {frames_dir:?}");
-    println!("Expected frames: {count}", count = 1 + 4 * args.iterations);
+    println!("Starting tree search: {} iterations", args.iterations);
+    println!("Guest memory: {}MB", args.mem);
+    println!("Output directory: {:?}", frames_dir);
+    println!("Expected frames: {}", 1 + 4 * args.iterations);
     println!();
 
     // ── Phase 1: Boot root VM ───────────────────────────────────────
+
     println!("Booting root VM...");
     let t_boot = Instant::now();
 
@@ -162,7 +161,7 @@ async fn main() -> Result<()> {
     );
 
     // ── Phase 2: Tree search ────────────────────────────────────────
-    let pool = VMPool::try_new(pool_dir).await?;
+    let mut pool = VMPool::try_new(pool_dir).await?;
     let mut current_vm = root_vm;
 
     for iteration in 0..args.iterations {
@@ -172,6 +171,9 @@ async fn main() -> Result<()> {
         // Fork: pause → snapshot → restore N children in parallel
         let t_fork = Instant::now();
         let fork_result = pool.fork(&mut current_vm, num_actions).await?;
+        // Parent is paused and no longer needed — kill it now to
+        // release its memory mappings before we step the children.
+        current_vm.destroy();
         println!("  Fork: {:.1}ms", t_fork.elapsed().as_secs_f64() * 1000.0);
 
         // Step all children in parallel — each takes a different action
@@ -201,8 +203,7 @@ async fn main() -> Result<()> {
             selected_idx, selected_action
         );
 
-        // Destroy parent and unselected children, keep selected
-        current_vm.destroy();
+        // Destroy unselected children, keep selected as next root
         current_vm = pool.select_and_cleanup(fork_result, selected_idx);
 
         println!(

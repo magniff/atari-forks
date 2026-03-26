@@ -309,25 +309,66 @@ impl FirecrackerVM {
         Ok(())
     }
 
-    pub async fn create_snapshot(&self, snapshot_dir: &Path) -> Result<Snapshot> {
+    /// Create a snapshot of this (paused) VM.
+    ///
+    /// When `diff` is false, creates a full snapshot: Firecracker dumps
+    /// all guest memory to `memory_path`. When `diff` is true, creates
+    /// a diff snapshot: FC writes only pages dirtied since the last
+    /// snapshot/restore into `memory_path`, overwriting those offsets
+    /// in-place. The caller must ensure `memory_path` already contains
+    /// a valid base image (from a previous full or merged-diff snapshot)
+    /// so that clean pages retain their correct content.
+    ///
+    /// After the write, we kick off async writeback via
+    /// `sync_file_range(SYNC_FILE_RANGE_WRITE)` to prevent dirty page
+    /// accumulation from causing stalls on later iterations.
+    pub async fn create_snapshot(
+        &self,
+        snapshot_dir: &Path,
+        memory_path: Option<&Path>,
+        diff: bool,
+    ) -> Result<Snapshot> {
         if self.state != VMState::Paused {
             bail!("VM must be paused before snapshotting");
         }
         std::fs::create_dir_all(snapshot_dir)?;
         let snap_dir = std::fs::canonicalize(snapshot_dir)?;
         let vmstate_path = snap_dir.join("vmstate");
-        let memory_path = snap_dir.join("memory");
+        let memory_path = memory_path
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| snap_dir.join("memory"));
+
+        let snapshot_type = if diff { "Diff" } else { "Full" };
 
         self.call_firecracker(
             "PUT",
             "/snapshot/create",
             Some(json!({
-                "snapshot_type": "Full",
+                "snapshot_type": snapshot_type,
                 "snapshot_path": vmstate_path.to_str().unwrap(),
                 "mem_file_path": memory_path.to_str().unwrap(),
             })),
         )
         .await?;
+
+        // Kick off async writeback of the memory file immediately.
+        //
+        // Firecracker writes guest memory into the page cache. Without
+        // this, the kernel accumulates dirty pages and eventually hits
+        // dirty_ratio, causing a *future* write/mmap call to block
+        // synchronously for writeback — random multi-second stalls.
+        //
+        // SYNC_FILE_RANGE_WRITE is non-blocking: starts writeback in
+        // the background and returns immediately.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Ok(f) = std::fs::File::open(&memory_path) {
+                unsafe {
+                    libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+                }
+            }
+        }
 
         Ok(Snapshot {
             vmstate_path,

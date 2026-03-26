@@ -35,4 +35,13 @@ impl Snapshot {
             let _ = std::fs::remove_dir(parent);
         }
     }
+
+    /// Remove only the vmstate file, keeping the memory file alive.
+    ///
+    /// Used with diff snapshots: the memory file is reused across
+    /// iterations as the base for subsequent diffs, so we can't
+    /// delete it. The vmstate is tiny and unique per snapshot.
+    pub fn cleanup_vmstate_only(&self) {
+        let _ = std::fs::remove_file(&self.vmstate_path);
+    }
 }
