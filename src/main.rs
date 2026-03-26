@@ -43,7 +43,7 @@ struct Args {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    #[arg(long)]
+    #[arg(long, default_value = "/dev/shm/vm-pool")]
     pool_dir: Option<PathBuf>,
 }
 
