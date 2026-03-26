@@ -143,10 +143,8 @@ impl FirecrackerVM {
         // Wait for API socket to become available
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if self.socket_path.exists() {
-                if self.call_firecracker("GET", "/", None).await.is_ok() {
-                    return Ok(());
-                }
+            if self.socket_path.exists() && self.call_firecracker("GET", "/", None).await.is_ok() {
+                return Ok(());
             }
             if tokio::time::Instant::now() > deadline {
                 bail!("Firecracker failed to start. Check {:?}", self.log_path);
