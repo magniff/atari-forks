@@ -66,7 +66,6 @@ impl Default for VMConfig {
 /// with it over a Unix domain socket (HTTP API via hyper).
 pub struct FirecrackerVM {
     pub config: VMConfig,
-    pub vm_id: String,
     pub state: VMState,
     pub work_dir: PathBuf,
     pub rootfs_path: PathBuf,
@@ -97,7 +96,6 @@ impl FirecrackerVM {
 
         Ok(Self {
             config,
-            vm_id: vm_id.to_string(),
             state: VMState::Created,
             socket_path: work_dir.join("firecracker.sock"),
             log_path: work_dir.join("firecracker.log"),
@@ -118,7 +116,12 @@ impl FirecrackerVM {
         Ok(())
     }
 
-    async fn spawn_process(&mut self) -> Result<()> {
+    /// Spawn the Firecracker process and wait for the API socket.
+    ///
+    /// After this returns, the process is idle and ready to accept
+    /// API calls (boot config or snapshot load). Public so that
+    /// `ProcessPool` can pre-warm processes.
+    pub async fn spawn_process(&mut self) -> Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
 
         let fc_bin = std::fs::canonicalize(&self.config.firecracker_bin)
@@ -378,23 +381,15 @@ impl FirecrackerVM {
         })
     }
 
-    /// Restore a VM from a snapshot.
+    /// Load a snapshot into an already-spawned Firecracker process.
     ///
-    /// The rootfs is shared read-only across all children — no copy
-    /// needed. Memory is loaded via MAP_PRIVATE by Firecracker, so
-    /// each restored VM gets its own CoW pages backed by the same
-    /// snapshot file on disk.
-    pub async fn restore_from_snapshot(
-        snapshot: &Snapshot,
-        work_dir: PathBuf,
-        vm_id: &str,
-        resume: bool,
-    ) -> Result<Self> {
-        let mut vm = Self::new(snapshot.config.clone(), Some(work_dir), vm_id)?;
-        vm.rootfs_path = snapshot.rootfs_path.clone();
-        vm.spawn_process().await?;
-
-        vm.call_firecracker(
+    /// The process must be freshly spawned (no prior boot or load).
+    /// This is the fast path used by the process pool — the spawn
+    /// and API socket wait have already happened, so this is just
+    /// one HTTP round-trip to Firecracker.
+    pub async fn load_snapshot(&mut self, snapshot: &Snapshot, resume: bool) -> Result<()> {
+        self.rootfs_path = snapshot.rootfs_path.clone();
+        self.call_firecracker(
             "PUT",
             "/snapshot/load",
             Some(json!({
@@ -409,12 +404,12 @@ impl FirecrackerVM {
         )
         .await?;
 
-        vm.state = if resume {
+        self.state = if resume {
             VMState::Running
         } else {
             VMState::Paused
         };
-        Ok(vm)
+        Ok(())
     }
 
     /// Absolute path to the vsock UDS.

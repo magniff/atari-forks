@@ -20,28 +20,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Remove snapshot files (vmstate + memory dump) from disk.
-    ///
-    /// Call this after all children restored from this snapshot have
-    /// been destroyed or have finished loading. The memory file may
-    /// still be mapped by child processes (MAP_PRIVATE), so the OS
-    /// keeps the pages alive until the last mapping is dropped — it's
-    /// safe to unlink eagerly.
-    pub fn cleanup(&self) {
-        let _ = std::fs::remove_file(&self.vmstate_path);
-        let _ = std::fs::remove_file(&self.memory_path);
-        // Also clean the snapshot directory if it's now empty
-        if let Some(parent) = self.vmstate_path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
-    }
-
     /// Remove only the vmstate file, keeping the memory file alive.
     ///
     /// Used with diff snapshots: the memory file is reused across
     /// iterations as the base for subsequent diffs, so we can't
     /// delete it. The vmstate is tiny and unique per snapshot.
-    pub fn cleanup_vmstate_only(&self) {
+    pub fn cleanup_vmstate(&self) {
         let _ = std::fs::remove_file(&self.vmstate_path);
     }
 }

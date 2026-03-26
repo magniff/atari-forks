@@ -9,6 +9,7 @@ use tokio::io::AsyncBufReadExt;
 
 mod atari_client;
 mod pool;
+mod process_pool;
 mod snapshot;
 mod vm;
 
@@ -18,7 +19,7 @@ use vm::{FirecrackerVM, VMConfig};
 
 #[derive(Parser)]
 #[command(name = "tree-search", about = "Atari Forking Tree Search Benchmark")]
-struct Args {
+struct Arguments {
     #[arg(long, default_value = "firecracker")]
     firecracker: PathBuf,
 
@@ -98,7 +99,7 @@ async fn wait_for_agent_ready(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Arguments::parse();
     let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
 
     let config = VMConfig {
@@ -161,7 +162,7 @@ async fn main() -> Result<()> {
     );
 
     // ── Phase 2: Tree search ────────────────────────────────────────
-    let mut pool = VMPool::try_new(pool_dir).await?;
+    let mut pool = VMPool::try_new(pool_dir, &config, num_actions).await?;
     let mut current_vm = root_vm;
 
     for iteration in 0..args.iterations {

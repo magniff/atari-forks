@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::atari_client::{AtariClient, StepResult};
+use crate::process_pool::ProcessPool;
 use crate::snapshot::Snapshot;
-use crate::vm::FirecrackerVM;
+use crate::vm::{FirecrackerVM, VMConfig};
 
 /// Result of forking a VM into multiple children.
 ///
@@ -16,7 +17,6 @@ use crate::vm::FirecrackerVM;
 pub struct ForkResult {
     pub children: Vec<FirecrackerVM>,
     pub snapshot: Snapshot,
-    pub fork_time_ms: f64,
 }
 
 impl Drop for ForkResult {
@@ -24,66 +24,70 @@ impl Drop for ForkResult {
         for child in &mut self.children {
             child.destroy();
         }
-        // Only clean vmstate — memory file is managed by the pool.
-        self.snapshot.cleanup_vmstate_only();
+        self.snapshot.cleanup_vmstate();
     }
 }
 
-/// Manages parallel VM forking with diff-snapshot acceleration.
+/// Manages parallel VM forking with diff snapshots and pre-warmed processes.
 ///
-/// Maintains a persistent base memory file under `base_dir`. The
-/// first fork creates a full snapshot (writing all guest memory).
-/// Subsequent forks create diff snapshots: Firecracker only writes
-/// pages dirtied since the last snapshot into the same memory file,
-/// overwriting those offsets in-place. Clean pages retain their
-/// content from previous iterations.
+/// Combines two optimizations:
 ///
-/// This works because:
-///   - Children mmap the file with MAP_PRIVATE (CoW). Modifying the
-///     file after they've mapped it doesn't affect their pages — the
-///     kernel already copied them on first write.
-///   - Between iterations, all children except the selected one are
-///     destroyed. The selected child has its own CoW pages. So it's
-///     safe to overwrite the memory file for the next diff.
-///   - Firecracker's dirty page tracking (enabled via
-///     `enable_diff_snapshots: true` on restore) resets the bitmap
-///     after each snapshot, so each diff captures exactly one
-///     iteration's worth of changes.
+/// 1. **Diff snapshots**: After the first full snapshot, subsequent
+///    forks write only dirty pages (~1-2MB vs 128MB).
+///
+/// 2. **Process pool**: Firecracker processes are pre-spawned in the
+///    background. When a fork needs children, it grabs already-running
+///    processes and sends a single `/snapshot/load` API call — skipping
+///    the ~30-40ms spawn+init overhead per child.
+///
+/// Together these reduce the fork critical path to roughly:
+///   pause (~1ms) + diff snapshot (~3-5ms) + snapshot load × N in
+///   parallel (~15-20ms) ≈ 20-25ms total.
 pub struct VMPool {
     pub base_dir: PathBuf,
     fork_counter: AtomicU64,
     /// Persistent memory file reused across diff snapshots.
-    /// None before the first fork, Some after.
     base_memory_path: Option<PathBuf>,
+    /// Pre-spawned Firecracker processes.
+    process_pool: ProcessPool,
 }
 
 impl VMPool {
-    pub async fn try_new(base_dir: PathBuf) -> Result<Self> {
-        // Ignore the error if the dir doesn't exist yet.
+    /// Create a new VMPool with a pre-warmed process pool.
+    ///
+    /// `pool_size` controls how many Firecracker processes to keep
+    /// warm. Set this to the number of children per fork (typically
+    /// the action count).
+    pub async fn try_new(base_dir: PathBuf, config: &VMConfig, pool_size: usize) -> Result<Self> {
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
         tokio::fs::create_dir_all(&base_dir).await?;
+        let base_dir = std::fs::canonicalize(&base_dir)?;
+
+        let proc_pool_dir = base_dir.join("proc-pool");
+        let process_pool = ProcessPool::new(config.clone(), proc_pool_dir, pool_size).await?;
+
         Ok(Self {
-            base_dir: std::fs::canonicalize(&base_dir)?,
+            base_dir,
             fork_counter: AtomicU64::new(0),
             base_memory_path: None,
+            process_pool,
         })
     }
 
     /// Fork a running VM into `num_children` children.
     ///
-    /// First call: full snapshot (writes all guest memory).
-    /// Subsequent calls: diff snapshot (writes only dirty pages into
-    /// the existing memory file).
-    ///
     /// 1. Pause the parent
     /// 2. Create a full or diff snapshot
-    /// 3. Spawn `num_children` VMs from the snapshot in parallel
+    /// 3. Grab pre-spawned processes from the pool
+    /// 4. Load the snapshot into each process in parallel
+    ///
+    /// Steps 3-4 are fast because the processes are already running
+    /// and just need a single `/snapshot/load` API call each.
     pub async fn fork(
         &mut self,
         parent: &mut FirecrackerVM,
         num_children: usize,
     ) -> Result<ForkResult> {
-        let t0 = std::time::Instant::now();
         let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         parent.pause().await?;
@@ -95,42 +99,39 @@ impl VMPool {
             .create_snapshot(&snap_dir, self.base_memory_path.as_deref(), is_diff)
             .await?;
 
-        // After the first full snapshot, remember the memory path
-        // for subsequent diffs to write into.
         if self.base_memory_path.is_none() {
             self.base_memory_path = Some(snapshot.memory_path.clone());
         }
 
+        // Grab pre-warmed processes — this also kicks off background
+        // replenishment for the next iteration.
+        let processes = self.process_pool.take(num_children).await?;
+
+        // Load the snapshot into each process in parallel.
         let children = self
-            .spawn_children(&snapshot, fork_id, num_children)
+            .load_snapshot_into_processes(processes, &snapshot)
             .await?;
 
-        Ok(ForkResult {
-            children,
-            snapshot,
-            fork_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        })
+        Ok(ForkResult { children, snapshot })
     }
 
-    async fn spawn_children(
+    /// Load a snapshot into pre-spawned processes in parallel.
+    async fn load_snapshot_into_processes(
         &self,
+        processes: Vec<FirecrackerVM>,
         snapshot: &Snapshot,
-        fork_id: u64,
-        num_children: usize,
     ) -> Result<Vec<FirecrackerVM>> {
-        let mut handles = Vec::with_capacity(num_children);
+        let mut handles = Vec::with_capacity(processes.len());
 
-        for i in 0..num_children {
-            let child_id = format!("fork{fork_id}-child{i}");
-            let child_dir = self.base_dir.join(&child_id);
+        for mut vm in processes {
             let snap = snapshot.clone();
-
             handles.push(tokio::spawn(async move {
-                FirecrackerVM::restore_from_snapshot(&snap, child_dir, &child_id, true).await
+                vm.load_snapshot(&snap, true).await?;
+                Ok::<_, anyhow::Error>(vm)
             }));
         }
 
-        let mut children = Vec::with_capacity(num_children);
+        let mut children = Vec::with_capacity(handles.len());
         let mut errors = Vec::new();
 
         for (i, handle) in handles.into_iter().enumerate() {
@@ -146,9 +147,8 @@ impl VMPool {
                 child.destroy();
             }
             bail!(
-                "Failed to spawn {} of {} children:\n{}",
+                "Failed to load snapshot into {} processes:\n{}",
                 errors.len(),
-                num_children,
                 errors.join("\n")
             );
         }
@@ -157,9 +157,6 @@ impl VMPool {
     }
 
     /// Step all children in parallel, each with a different action.
-    ///
-    /// Connects to each child's vsock concurrently and sends a step
-    /// command. Returns results in the same order as `actions`.
     pub async fn step_all(children: &[FirecrackerVM], actions: &[i64]) -> Result<Vec<StepResult>> {
         assert_eq!(children.len(), actions.len());
 
@@ -196,10 +193,6 @@ impl VMPool {
     }
 
     /// Select one child as the new "current" VM, destroy the rest.
-    ///
-    /// Kills unselected Firecracker processes immediately (SIGKILL),
-    /// then moves filesystem cleanup to a background task. The base
-    /// memory file is preserved for the next diff snapshot.
     pub fn select_and_cleanup(
         &self,
         mut result: ForkResult,
@@ -207,17 +200,14 @@ impl VMPool {
     ) -> FirecrackerVM {
         let selected = result.children.remove(selected_index);
 
-        // SIGKILL all unselected children — non-blocking syscall.
         let mut dirs_to_remove: Vec<PathBuf> = Vec::with_capacity(result.children.len());
         for mut child in result.children.drain(..) {
             dirs_to_remove.push(child.work_dir.clone());
             child.destroy();
         }
 
-        // Clean vmstate only — memory file is reused for diffs.
         let snap_vmstate = result.snapshot.vmstate_path.clone();
 
-        // Move filesystem cleanup off the hot path.
         tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_file(&snap_vmstate);
             if let Some(parent) = snap_vmstate.parent() {
