@@ -106,7 +106,7 @@ impl VMPool {
     }
 
     /// Take `n` idle VMs from the warm pool, blocking until available.
-    fn take_warm(&self, n: usize) -> Vec<FirecrackerVM> {
+    pub fn take_warm(&self, n: usize) -> Vec<FirecrackerVM> {
         loop {
             {
                 let mut pool = self.warm_pool.lock().unwrap();
