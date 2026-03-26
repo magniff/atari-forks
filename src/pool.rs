@@ -125,8 +125,13 @@ impl VMPool {
         let t0 = std::time::Instant::now();
         let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Pause and snapshot to /dev/shm (tmpfs) for speed
+        // Pause
+        let tp = std::time::Instant::now();
         parent.pause()?;
+        let pause_us = tp.elapsed().as_micros();
+
+        // Snapshot
+        let ts = std::time::Instant::now();
         let shm_base = std::path::Path::new("/dev/shm");
         let snap_dir = if shm_base.exists() {
             shm_base.join(format!("atari-fork-snap-{fork_id}"))
@@ -134,11 +139,15 @@ impl VMPool {
             self.base_dir.join(format!("snap-{fork_id}"))
         };
         let snapshot = parent.create_snapshot(&snap_dir)?;
+        let snap_us = ts.elapsed().as_micros();
 
-        // Grab pre-spawned processes from the warm pool
+        // Take warm VMs
+        let tw = std::time::Instant::now();
         let idle_vms = self.take_warm(num_children);
+        let warm_us = tw.elapsed().as_micros();
 
-        // Load snapshot into each in parallel — this is the only work at fork time
+        // Load snapshot in parallel
+        let tl = std::time::Instant::now();
         let handles: Vec<_> = idle_vms
             .into_iter()
             .map(|mut vm| {
@@ -158,6 +167,14 @@ impl VMPool {
                 Ok(Err(e)) => errors.push((i, e)),
                 Err(_) => errors.push((i, anyhow::anyhow!("thread panicked"))),
             }
+        }
+        let load_us = tl.elapsed().as_micros();
+
+        if fork_id % 50 == 1 {
+            eprintln!(
+                "[fork] pause={}us snap={}us warm={}us load={}us",
+                pause_us, snap_us, warm_us, load_us
+            );
         }
 
         if !errors.is_empty() {
