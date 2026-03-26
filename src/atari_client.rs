@@ -67,23 +67,23 @@ impl AtariClient {
 
         loop {
             match UnixStream::connect(uds_path) {
-                Ok(mut sock) => {
+                Ok(sock) => {
                     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
                     sock.set_write_timeout(Some(Duration::from_secs(5)))?;
 
                     // Firecracker vsock handshake: CONNECT <port>\n -> OK <port>\n
                     let cmd = format!("CONNECT {VSOCK_GUEST_PORT}\n");
-                    sock.write_all(cmd.as_bytes())?;
+                    (&sock).write_all(cmd.as_bytes())?;
 
                     let mut response = String::new();
                     let mut reader = BufReader::new(&sock);
                     reader.read_line(&mut response)?;
 
                     if response.starts_with("OK") {
-                        // Reconstruct the stream from the reader
                         drop(reader);
                         return Ok(sock);
                     }
+                    // Handshake failed — retry
                 }
                 Err(_) => {}
             }
@@ -91,7 +91,7 @@ impl AtariClient {
             if std::time::Instant::now() > deadline {
                 bail!("Could not connect to guest via vsock at {:?}", uds_path);
             }
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -101,11 +101,16 @@ impl AtariClient {
 
         let mut reader = BufReader::new(&self.stream);
         let mut line = String::new();
-        reader
+        let bytes_read = reader
             .read_line(&mut line)
             .context("read response from guest")?;
 
-        let response: Value = serde_json::from_str(line.trim()).context("parse guest response")?;
+        if bytes_read == 0 {
+            bail!("Guest disconnected (EOF) — VM may have crashed or been killed");
+        }
+
+        let response: Value = serde_json::from_str(line.trim())
+            .with_context(|| format!("parse guest response: {:?}", line.trim()))?;
 
         if response.get("status").and_then(|s| s.as_str()) == Some("error") {
             let msg = response

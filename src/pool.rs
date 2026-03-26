@@ -125,7 +125,7 @@ impl VMPool {
         let t0 = std::time::Instant::now();
         let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Pause and snapshot
+        // Pause and snapshot to /dev/shm (tmpfs) for speed
         parent.pause()?;
         let shm_base = std::path::Path::new("/dev/shm");
         let snap_dir = if shm_base.exists() {
@@ -178,22 +178,16 @@ impl VMPool {
         })
     }
 
-    /// Select one child, destroy the rest, clean up snapshot.
-    pub fn select_and_cleanup(
+    /// Extract the selected child. Returns (selected, discarded_children, snapshot).
+    /// Caller is responsible for destroying the discarded children and snapshot
+    /// (e.g. in a background thread).
+    pub fn select(
         &self,
         mut result: ForkResult,
         selected_index: usize,
-    ) -> FirecrackerVM {
+    ) -> (FirecrackerVM, Vec<FirecrackerVM>, Snapshot) {
         let selected = result.children.remove(selected_index);
-
-        for mut child in result.children {
-            let dir = child.work_dir.clone();
-            child.destroy();
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        result.snapshot.cleanup();
-        selected
+        (selected, result.children, result.snapshot)
     }
 }
 

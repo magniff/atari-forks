@@ -148,13 +148,21 @@ fn main() -> Result<()> {
 
     let mut current_vm = root_vm;
 
-    // Background cleanup — destroy old parent VMs without blocking the hot path
+    // Background cleanup — destroy old VMs off the hot path
     let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel::<FirecrackerVM>();
     let _cleanup_thread = std::thread::spawn(move || {
         for mut vm in cleanup_rx {
             let dir = vm.work_dir.clone();
             vm.destroy();
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+
+    // Background frame saver — write PNGs without blocking the hot path
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(PathBuf, Vec<u8>)>();
+    let _frame_thread = std::thread::spawn(move || {
+        for (path, data) in frame_rx {
+            let _ = std::fs::write(&path, &data);
         }
     });
 
@@ -176,12 +184,25 @@ fn main() -> Result<()> {
                 let vsock_path = fork_result.children[child_idx].vsock_uds_path();
                 let action = *action;
                 std::thread::spawn(move || -> anyhow::Result<(i64, atari_client::StepResult)> {
-                    let mut client = AtariClient::connect_vsock(
-                        &vsock_path,
-                        std::time::Duration::from_secs(10),
-                    )?;
-                    let result = client.step(action)?;
-                    Ok((action, result))
+                    // Retry once on connection failure
+                    for attempt in 0..2 {
+                        match (|| -> anyhow::Result<_> {
+                            let mut client = AtariClient::connect_vsock(
+                                &vsock_path,
+                                std::time::Duration::from_secs(5),
+                            )?;
+                            let result = client.step(action)?;
+                            Ok((action, result))
+                        })() {
+                            Ok(r) => return Ok(r),
+                            Err(e) if attempt == 0 => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    unreachable!()
                 })
             })
             .collect();
@@ -203,7 +224,7 @@ fn main() -> Result<()> {
             child_rewards.push(result.reward);
 
             let frame_name = format!("frame_{:06}.png", frame_count);
-            save_frame(&result.obs, &frames_dir.join(&frame_name))?;
+            let _ = frame_tx.send((frames_dir.join(&frame_name), result.obs.clone()));
 
             let mut hist_actions = current_actions.clone();
             hist_actions.push(*action);
@@ -227,11 +248,19 @@ fn main() -> Result<()> {
         current_actions.push(selected_action);
         current_rewards.push(selected_reward);
 
-        // Destroy old parent in background (it's paused, just needs kill+wait)
-        let old_vm = std::mem::replace(
-            &mut current_vm,
-            pool.select_and_cleanup(fork_result, selected_idx),
-        );
+        // Select child, send everything else to background cleanup
+        let (selected, discarded, snapshot) = pool.select(fork_result, selected_idx);
+        let old_vm = std::mem::replace(&mut current_vm, selected);
+        // Kill discarded children synchronously — they hold MAP_PRIVATE
+        // mmaps of the snapshot memory file on /dev/shm. Must die before
+        // the next snapshot or tmpfs fills up.
+        for mut child in discarded {
+            child.destroy();
+            let _ = std::fs::remove_dir_all(&child.work_dir);
+        }
+        // Delete snapshot files now that children are dead
+        snapshot.cleanup();
+        // Old parent can die in the background — it's just one VM
         let _ = cleanup_tx.send(old_vm);
 
         let iter_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
