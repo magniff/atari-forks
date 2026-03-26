@@ -35,7 +35,7 @@ impl Default for VMConfig {
             kernel_path: PathBuf::new(),
             rootfs_path: PathBuf::new(),
             vcpu_count: 1,
-            mem_size_mib: 128,
+            mem_size_mib: 64,
             boot_args:
                 "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on ro init=/opt/init.sh"
                     .into(),
