@@ -15,7 +15,6 @@ use crate::vm::FirecrackerVM;
 pub struct ForkResult {
     pub children: Vec<FirecrackerVM>,
     pub snapshot: Snapshot,
-    pub fork_time_ms: f64,
 }
 
 impl Drop for ForkResult {
@@ -59,11 +58,9 @@ impl VMPool {
         parent: &mut FirecrackerVM,
         num_children: usize,
     ) -> Result<ForkResult> {
-        let t0 = std::time::Instant::now();
         let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Pause and snapshot
         parent.pause().await?;
+
         let snap_dir = self.base_dir.join(format!("snap-{fork_id}"));
         let snapshot = parent.create_snapshot(&snap_dir).await?;
 
@@ -72,11 +69,7 @@ impl VMPool {
             .spawn_children(&snapshot, fork_id, num_children)
             .await?;
 
-        Ok(ForkResult {
-            children,
-            snapshot,
-            fork_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        })
+        Ok(ForkResult { children, snapshot })
     }
 
     async fn spawn_children(

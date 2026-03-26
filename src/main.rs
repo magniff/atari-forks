@@ -114,7 +114,6 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(frames_dir)?;
 
     // ── Set up pool directory (optionally on tmpfs) ─────────────────
-
     let pool_dir = args
         .pool_dir
         .unwrap_or_else(|| frames_dir.parent().unwrap_or(frames_dir).join("vm-pool"));
@@ -122,14 +121,16 @@ async fn main() -> Result<()> {
 
     let mut frame_count = 0usize;
 
-    println!("Starting tree search: {} iterations", args.iterations);
-    println!("Guest memory: {}MB", args.mem);
-    println!("Output directory: {:?}", frames_dir);
-    println!("Expected frames: {}", 1 + 4 * args.iterations);
+    println!(
+        "Starting tree search: {iterations} iterations",
+        iterations = args.iterations
+    );
+    println!("Guest memory: {mem}MB", mem = args.mem);
+    println!("Output directory: {frames_dir:?}");
+    println!("Expected frames: {count}", count = 1 + 4 * args.iterations);
     println!();
 
     // ── Phase 1: Boot root VM ───────────────────────────────────────
-
     println!("Booting root VM...");
     let t_boot = Instant::now();
 

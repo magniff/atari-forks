@@ -7,6 +7,12 @@ use tokio::net::UnixStream;
 
 const VSOCK_GUEST_PORT: u16 = 5005;
 
+pub struct StepResult {
+    pub obs: Vec<u8>,
+    pub reward: f64,
+    pub done: bool,
+}
+
 /// Host-side client for the Atari guest agent.
 ///
 /// Connects via Firecracker's vsock AF_UNIX proxy. Uses a persistent
@@ -31,40 +37,31 @@ impl AtariClient {
     /// immediately (it just queues the connect request), so without
     /// this probe we'd race the guest-side cleanup and occasionally
     /// get EOF when sending the real command.
-    pub async fn connect(vsock_uds_path: &Path, timeout: Duration) -> Result<Self> {
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            match Self::try_connect_once(vsock_uds_path).await {
-                Ok(mut client) => {
-                    // Probe: verify the Python agent is actually on
-                    // the other end, not a stale/dying connection.
-                    match client
-                        .send_command(&serde_json::json!({"cmd": "get_actions"}))
-                        .await
-                    {
-                        Ok(_) => return Ok(client),
-                        Err(_) => {
-                            // Connection was stale — drop it and retry.
-                            // Python is likely cycling back to accept().
-                        }
-                    }
-                }
-                Err(_) => { /* socket not ready yet, retry */ }
-            }
-
-            if tokio::time::Instant::now() > deadline {
-                bail!(
-                    "Could not connect to guest via vsock at {:?}",
-                    vsock_uds_path
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
     /// Attempt a single vsock connect + Firecracker handshake.
     /// Returns Err if the socket isn't available or the handshake fails.
+    pub async fn connect(vsock_uds_path: &Path, timeout: Duration) -> Result<Self> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(mut client) = Self::try_connect_once(vsock_uds_path).await {
+                    if client
+                        .send_command(&serde_json::json!({"cmd": "get_actions"}))
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(client);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Could not connect to guest via vsock at {vsock_uds_path:?} within {timeout:?}"
+            )
+        })?
+    }
+
     async fn try_connect_once(vsock_uds_path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(vsock_uds_path).await?;
         let (read_half, mut write_half) = tokio::io::split(stream);
@@ -82,31 +79,33 @@ impl AtariClient {
                 writer: write_half,
             })
         } else {
-            bail!("vsock handshake rejected: {}", response.trim());
+            bail!(
+                "vsock handshake rejected: {response}",
+                response = response.trim()
+            );
         }
     }
 
     /// Send a JSON command and read a JSON response (newline-delimited).
     async fn send_command(&mut self, cmd: &Value) -> Result<Value> {
-        let msg = format!("{}\n", cmd);
-        self.writer.write_all(msg.as_bytes()).await?;
+        self.writer.write_all(format!("{cmd}\n").as_bytes()).await?;
 
         let mut line = String::new();
-        let n = self
+        let bytes_read = self
             .reader
             .read_line(&mut line)
             .await
             .context("read response from guest")?;
-        if n == 0 {
+
+        if bytes_read == 0 {
             bail!("EOF from guest agent");
         }
 
         let response: Value = serde_json::from_str(line.trim()).context("parse guest response")?;
-
         if response.get("status").and_then(|s| s.as_str()) == Some("error") {
             let msg = response
                 .get("message")
-                .and_then(|m| m.as_str())
+                .and_then(|message| message.as_str())
                 .unwrap_or("unknown error");
             bail!("Guest error: {msg}");
         }
@@ -122,38 +121,34 @@ impl AtariClient {
     }
 
     pub async fn step(&mut self, action: i64) -> Result<StepResult> {
-        let resp = self
+        let response = self
             .send_command(&serde_json::json!({"cmd": "step", "action": action}))
             .await?;
         Ok(StepResult {
-            obs: decode_obs(&resp)?,
-            reward: resp["reward"].as_f64().unwrap_or(0.0),
-            done: resp["done"].as_bool().unwrap_or(false),
+            obs: decode_obs(&response)?,
+            reward: response["reward"].as_f64().unwrap_or(0.0),
+            done: response["done"].as_bool().unwrap_or(false),
         })
     }
 
     pub async fn get_legal_actions(&mut self) -> Result<Vec<i64>> {
-        let resp = self
+        let response = self
             .send_command(&serde_json::json!({"cmd": "get_actions"}))
             .await?;
-        let actions = resp["actions"]
+        Ok(response["actions"]
             .as_array()
             .context("missing actions")?
             .iter()
             .filter_map(|v| v.as_i64())
-            .collect();
-        Ok(actions)
+            .collect())
     }
 }
 
-fn decode_obs(resp: &Value) -> Result<Vec<u8>> {
-    let obs_b64 = resp["obs"].as_str().context("missing obs field")?;
-    let obs = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, obs_b64)?;
-    Ok(obs)
-}
-
-pub struct StepResult {
-    pub obs: Vec<u8>,
-    pub reward: f64,
-    pub done: bool,
+fn decode_obs(response: &Value) -> Result<Vec<u8>> {
+    Ok({
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            response["obs"].as_str().context("missing obs field")?,
+        )?
+    })
 }
