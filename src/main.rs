@@ -37,11 +37,26 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     vcpus: u32,
 
-    #[arg(long, default_value_t = 256)]
+    /// Guest memory in MiB. ALE + Python fits in 128MB; lower = faster snapshots.
+    #[arg(long, default_value_t = 128)]
     mem: u32,
 
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    /// Directory for snapshots and child VM work dirs.
+    /// Point this at a tmpfs mount for best performance (avoids disk I/O
+    /// for the ~128MB memory snapshot). If --tmpfs is set, a tmpfs is
+    /// mounted here automatically.
+    #[arg(long)]
+    pool_dir: Option<PathBuf>,
+
+    /// Automatically mount a tmpfs at the pool directory.
+    /// Requires root (or CAP_SYS_ADMIN). Size is set to 2× guest memory
+    /// × max_children to hold snapshots + FC process working state.
+    /// The tmpfs is unmounted on exit.
+    #[arg(long, default_value_t = false)]
+    tmpfs: bool,
 }
 
 fn save_frame(data: &[u8], path: &PathBuf) -> Result<()> {
@@ -117,13 +132,71 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(frames_dir)?;
     let history_path = frames_dir.join("history.json");
 
+    // ── Set up pool directory (optionally on tmpfs) ─────────────────
+
+    let pool_dir = args
+        .pool_dir
+        .unwrap_or_else(|| frames_dir.parent().unwrap_or(frames_dir).join("vm-pool"));
+    std::fs::create_dir_all(&pool_dir)?;
+
+    let mut tmpfs_mounted = false;
+    if args.tmpfs {
+        // Size the tmpfs to hold: 1 snapshot (mem_size) + N child work dirs
+        // (mostly just sockets/logs, a few KB each). 3× mem is plenty.
+        let tmpfs_size_mb = args.mem as u64 * 3;
+        let pool_dir_str = pool_dir.to_str().unwrap();
+        let status = std::process::Command::new("mount")
+            .args([
+                "-t",
+                "tmpfs",
+                "-o",
+                &format!("size={}m", tmpfs_size_mb),
+                "tmpfs",
+                pool_dir_str,
+            ])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                tmpfs_mounted = true;
+                println!("Mounted tmpfs ({}MB) at {:?}", tmpfs_size_mb, pool_dir);
+            }
+            Ok(s) => {
+                eprintln!(
+                    "Warning: failed to mount tmpfs (exit {}). \
+                     Continuing with regular filesystem. \
+                     Run as root or use 'sudo' for tmpfs support.",
+                    s.code().unwrap_or(-1)
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not run mount command: {e}. \
+                     Continuing with regular filesystem."
+                );
+            }
+        }
+    }
+
+    // Guard: unmount tmpfs on exit (normal or early return via ?).
+    // Also detects if pool_dir is already a tmpfs even without --tmpfs.
+    let _tmpfs_guard = TmpfsGuard {
+        path: if tmpfs_mounted {
+            Some(pool_dir.clone())
+        } else {
+            None
+        },
+    };
+
     let mut frame_count = 0usize;
     let mut frame_history: HashMap<String, serde_json::Value> = HashMap::new();
     let mut current_actions: Vec<i64> = Vec::new();
     let mut current_rewards: Vec<f64> = Vec::new();
 
     println!("Starting tree search: {} iterations", args.iterations);
+    println!("Guest memory: {}MB", args.mem);
     println!("Output directory: {:?}", frames_dir);
+    println!("Pool directory: {:?} (tmpfs: {})", pool_dir, tmpfs_mounted);
     println!("Expected frames: {}", 1 + 4 * args.iterations);
     println!();
 
@@ -164,7 +237,6 @@ async fn main() -> Result<()> {
 
     // ── Phase 2: Tree search ────────────────────────────────────────
 
-    let pool_dir = frames_dir.parent().unwrap_or(frames_dir).join("vm-pool");
     let pool = VMPool::new(pool_dir, num_actions)?;
 
     let mut current_vm = root_vm;
@@ -252,3 +324,17 @@ async fn main() -> Result<()> {
 }
 
 use rand::SeedableRng;
+
+/// RAII guard that unmounts a tmpfs on drop.
+struct TmpfsGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for TmpfsGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            eprintln!("[cleanup] Unmounting tmpfs at {:?}", path);
+            let _ = std::process::Command::new("umount").arg(path).status();
+        }
+    }
+}
