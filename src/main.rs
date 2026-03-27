@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use rand::SeedableRng;
 use tokio::io::AsyncBufReadExt;
@@ -131,7 +132,14 @@ async fn main() -> Result<()> {
 
     // ── Phase 1: Boot root VM ───────────────────────────────────────
 
-    println!("Booting root VM...");
+    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(spinner_style.clone());
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    spinner.set_message("Booting root VM...");
     let t_boot = Instant::now();
 
     let mut root_vm = FirecrackerVM::new(config.clone(), None, "root")?;
@@ -148,7 +156,6 @@ async fn main() -> Result<()> {
 
     let actions = client.get_legal_actions().await?;
     let num_actions = actions.len();
-    println!("Legal actions: {:?} ({} total)", actions, num_actions);
 
     let initial_obs = client.reset().await?;
     let frame_name = format!("frame_{:06}.png", frame_count);
@@ -156,64 +163,65 @@ async fn main() -> Result<()> {
     frame_count += 1;
     drop(client);
 
-    println!(
-        "Boot + reset took {:.1}ms",
+    spinner.finish_with_message(format!(
+        "Root VM ready — actions: {:?}  boot+reset: {:.1}ms",
+        actions,
         t_boot.elapsed().as_secs_f64() * 1000.0
-    );
+    ));
 
     // ── Phase 2: Tree search ────────────────────────────────────────
     let mut pool = VMScheduler::try_new(pool_dir, &config, num_actions * 4).await?;
     let mut current_vm = root_vm;
 
-    for iteration in 0..args.iterations {
+    let progress_style =
+        ProgressStyle::with_template("{spinner:.cyan} iter {pos}/{len}  fork {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
+    let pb = ProgressBar::new(args.iterations as u64);
+    pb.set_style(progress_style);
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    for _ in 0..args.iterations {
         let t_iter = Instant::now();
-        println!("--- Iteration {}/{} ---", iteration + 1, args.iterations);
 
         // Fork: pause → snapshot → restore N children in parallel
         let t_fork = Instant::now();
+        pb.set_message("forking...");
         let fork_result = pool.fork(&mut current_vm, num_actions).await?;
         // Parent is paused and no longer needed — kill it now to
         // release its memory mappings before we step the children.
         current_vm.destroy();
-        println!("  Fork: {:.1}ms", t_fork.elapsed().as_secs_f64() * 1000.0);
+        let fork_ms = t_fork.elapsed().as_secs_f64() * 1000.0;
 
         // Step all children in parallel — each takes a different action
         let t_step = Instant::now();
+        pb.set_message(format!("{fork_ms:.1}ms  stepping..."));
         let step_results = VMScheduler::step_all(&fork_result.children, &actions).await?;
-        println!(
-            "  Step all (parallel): {:.1}ms",
-            t_step.elapsed().as_secs_f64() * 1000.0
-        );
+        let step_ms = t_step.elapsed().as_secs_f64() * 1000.0;
 
         // Record results
-        for (action, result) in actions.iter().zip(step_results.iter()) {
+        for result in step_results.iter() {
             let frame_name = format!("frame_{:06}.png", frame_count);
             save_frame(&result.obs, &frames_dir.join(&frame_name)).await?;
             frame_count += 1;
-            println!(
-                "  Action {}: reward={:.1}, done={}",
-                action, result.reward, result.done
-            );
         }
 
         // Select a random child as the new root
         let selected_idx = rng.gen_range(0..num_actions);
         let selected_action = actions[selected_idx];
-        println!(
-            "  Selected child {} (action {})",
-            selected_idx, selected_action
-        );
 
         // Destroy unselected children, keep selected as next root
         current_vm = pool.select_and_cleanup(fork_result, selected_idx);
 
-        println!(
-            "  Total iteration: {:.1}ms",
-            t_iter.elapsed().as_secs_f64() * 1000.0
-        );
-        println!();
+        let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
+        pb.set_message(format!(
+            "{fork_ms:.1}ms  step {step_ms:.1}ms  total {total_ms:.1}ms  selected action {selected_action}"
+        ));
+        pb.inc(1);
     }
 
+    pb.finish_and_clear();
     current_vm.destroy();
 
     println!();
