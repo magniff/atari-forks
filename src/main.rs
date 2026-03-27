@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
     );
 
     // ── Phase 2: Tree search ────────────────────────────────────────
-    let mut pool = VMPool::try_new(pool_dir, &config, num_actions).await?;
+    let mut pool = VMPool::try_new(pool_dir, &config, num_actions * 4).await?;
     let mut current_vm = root_vm;
 
     for iteration in 0..args.iterations {
