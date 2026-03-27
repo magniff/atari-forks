@@ -43,7 +43,7 @@ impl Drop for ForkResult {
 /// Together these reduce the fork critical path to roughly:
 ///   pause (~1ms) + diff snapshot (~3-5ms) + snapshot load × N in
 ///   parallel (~15-20ms) ≈ 20-25ms total.
-pub struct VMPool {
+pub struct VMScheduler {
     pub base_dir: PathBuf,
     fork_counter: AtomicU64,
     /// Persistent memory file reused across diff snapshots.
@@ -52,7 +52,7 @@ pub struct VMPool {
     process_pool: ProcessPool,
 }
 
-impl VMPool {
+impl VMScheduler {
     /// Create a new VMPool with a pre-warmed process pool.
     ///
     /// `pool_size` controls how many Firecracker processes to keep
@@ -222,7 +222,7 @@ impl VMPool {
     }
 }
 
-impl Drop for VMPool {
+impl Drop for VMScheduler {
     fn drop(&mut self) {
         if self.base_dir.exists() {
             let _ = std::fs::remove_dir_all(&self.base_dir);

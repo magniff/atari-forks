@@ -8,13 +8,13 @@ use rand::SeedableRng;
 use tokio::io::AsyncBufReadExt;
 
 mod atari_client;
-mod pool;
 mod process_pool;
+mod scheduler;
 mod snapshot;
 mod vm;
 
 use atari_client::AtariClient;
-use pool::VMPool;
+use scheduler::VMScheduler;
 use vm::{FirecrackerVM, VMConfig};
 
 #[derive(Parser)]
@@ -44,7 +44,7 @@ struct Arguments {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    #[arg(long)]
+    #[arg(long, default_value = "/dev/shm/atari-pool")]
     pool_dir: Option<PathBuf>,
 }
 
@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
     );
 
     // ── Phase 2: Tree search ────────────────────────────────────────
-    let mut pool = VMPool::try_new(pool_dir, &config, num_actions * 4).await?;
+    let mut pool = VMScheduler::try_new(pool_dir, &config, num_actions * 4).await?;
     let mut current_vm = root_vm;
 
     for iteration in 0..args.iterations {
@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
 
         // Step all children in parallel — each takes a different action
         let t_step = Instant::now();
-        let step_results = VMPool::step_all(&fork_result.children, &actions).await?;
+        let step_results = VMScheduler::step_all(&fork_result.children, &actions).await?;
         println!(
             "  Step all (parallel): {:.1}ms",
             t_step.elapsed().as_secs_f64() * 1000.0
