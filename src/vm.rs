@@ -312,13 +312,12 @@ impl FirecrackerVM {
 
     /// Create a snapshot of this (paused) VM.
     ///
-    /// When `diff` is false, creates a full snapshot: Firecracker dumps
-    /// all guest memory to `memory_path`. When `diff` is true, creates
-    /// a diff snapshot: FC writes only pages dirtied since the last
-    /// snapshot/restore into `memory_path`, overwriting those offsets
-    /// in-place. The caller must ensure `memory_path` already contains
-    /// a valid base image (from a previous full or merged-diff snapshot)
-    /// so that clean pages retain their correct content.
+    /// When `memory_path` is `None`, creates a full snapshot: Firecracker
+    /// dumps all guest memory to `<snapshot_dir>/memory`. When `memory_path`
+    /// is `Some(base)`, creates a diff snapshot: FC writes only pages dirtied
+    /// since the last snapshot/restore into `base`, overwriting those offsets
+    /// in-place. The caller must ensure `base` already contains a valid full
+    /// image so that clean pages retain their correct content.
     ///
     /// After the write, we kick off async writeback via
     /// `sync_file_range(SYNC_FILE_RANGE_WRITE)` to prevent dirty page
@@ -327,7 +326,6 @@ impl FirecrackerVM {
         &self,
         snapshot_dir: &Path,
         memory_path: Option<&Path>,
-        diff: bool,
     ) -> Result<Snapshot> {
         if self.state != VMState::Paused {
             bail!("VM must be paused before snapshotting");
@@ -335,11 +333,12 @@ impl FirecrackerVM {
         std::fs::create_dir_all(snapshot_dir)?;
         let snap_dir = std::fs::canonicalize(snapshot_dir)?;
         let vmstate_path = snap_dir.join("vmstate");
+        let is_diff = memory_path.is_some();
         let memory_path = memory_path
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| snap_dir.join("memory"));
 
-        let snapshot_type = if diff { "Diff" } else { "Full" };
+        let snapshot_type = if is_diff { "Diff" } else { "Full" };
 
         self.call_firecracker(
             "PUT",

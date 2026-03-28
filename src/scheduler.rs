@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::atari_client::{AtariClient, StepResult};
@@ -45,7 +44,7 @@ impl Drop for ForkResult {
 ///   parallel (~15-20ms) ≈ 20-25ms total.
 pub struct VMScheduler {
     pub base_dir: PathBuf,
-    fork_counter: AtomicU64,
+    fork_counter: u64,
     /// Persistent memory file reused across diff snapshots.
     base_memory_path: Option<PathBuf>,
     /// Pre-spawned Firecracker processes.
@@ -68,7 +67,7 @@ impl VMScheduler {
 
         Ok(Self {
             base_dir,
-            fork_counter: AtomicU64::new(0),
+            fork_counter: 0,
             base_memory_path: None,
             process_pool,
         })
@@ -88,15 +87,13 @@ impl VMScheduler {
         parent: &mut FirecrackerVM,
         num_children: usize,
     ) -> Result<ForkResult> {
-        let fork_id = self.fork_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.fork_counter += 1;
+        let snap_dir = self.base_dir.join(format!("snap-{}", self.fork_counter));
 
         parent.pause().await?;
 
-        let snap_dir = self.base_dir.join(format!("snap-{fork_id}"));
-        let is_diff = self.base_memory_path.is_some();
-
         let snapshot = parent
-            .create_snapshot(&snap_dir, self.base_memory_path.as_deref(), is_diff)
+            .create_snapshot(&snap_dir, self.base_memory_path.as_deref())
             .await?;
 
         if self.base_memory_path.is_none() {

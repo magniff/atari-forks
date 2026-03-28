@@ -6,6 +6,13 @@ use tokio::sync::Mutex;
 
 use crate::vm::{FirecrackerVM, VMConfig};
 
+/// Spawn a single Firecracker process and wait for its API socket.
+async fn spawn_one_process(config: VMConfig, work_dir: PathBuf, vm_id: String) -> Result<FirecrackerVM> {
+    let mut vm = FirecrackerVM::new(config, Some(work_dir), &vm_id)?;
+    vm.spawn_process().await?;
+    Ok(vm)
+}
+
 /// A pool of pre-spawned Firecracker processes ready for snapshot load.
 ///
 /// Each pooled process has completed the expensive part of startup:
@@ -77,13 +84,7 @@ impl ProcessPool {
             let id = self.counter.fetch_add(1, Ordering::Relaxed);
             let vm_id = format!("pool-{id}");
             let work_dir = self.base_dir.join(&vm_id);
-            let config = self.config.clone();
-
-            handles.push(tokio::spawn(async move {
-                let mut vm = FirecrackerVM::new(config, Some(work_dir), &vm_id)?;
-                vm.spawn_process().await?;
-                Ok::<_, anyhow::Error>(vm)
-            }));
+            handles.push(tokio::spawn(spawn_one_process(self.config.clone(), work_dir, vm_id)));
         }
 
         let mut vms = Vec::with_capacity(count);
@@ -139,13 +140,7 @@ impl ProcessPool {
                 let id = self.counter.fetch_add(1, Ordering::Relaxed);
                 let vm_id = format!("pool-{id}");
                 let work_dir = self.base_dir.join(&vm_id);
-                let config = self.config.clone();
-
-                handles.push(tokio::spawn(async move {
-                    let mut vm = FirecrackerVM::new(config, Some(work_dir), &vm_id)?;
-                    vm.spawn_process().await?;
-                    Ok::<_, anyhow::Error>(vm)
-                }));
+                handles.push(tokio::spawn(spawn_one_process(self.config.clone(), work_dir, vm_id)));
             }
 
             for handle in handles {
@@ -200,13 +195,7 @@ impl ProcessPool {
             for &id in ids {
                 let vm_id = format!("pool-{id}");
                 let work_dir = base_dir.join(&vm_id);
-                let config = config.clone();
-
-                handles.push(tokio::spawn(async move {
-                    let mut vm = FirecrackerVM::new(config, Some(work_dir), &vm_id)?;
-                    vm.spawn_process().await?;
-                    Ok::<_, anyhow::Error>(vm)
-                }));
+                handles.push(tokio::spawn(spawn_one_process(config.clone(), work_dir, vm_id)));
             }
 
             let mut vms = Vec::with_capacity(needed);

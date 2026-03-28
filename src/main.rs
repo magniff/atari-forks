@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -49,7 +49,7 @@ struct Arguments {
     pool_dir: Option<PathBuf>,
 }
 
-async fn save_frame(data: &[u8], path: &PathBuf) -> Result<()> {
+async fn save_frame(data: &[u8], path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -66,8 +66,8 @@ async fn wait_for_agent_ready(
     stdout: tokio::process::ChildStdout,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ready_clone = ready.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let mut tx = Some(tx);
 
     // Drain stdout in background — must keep reading even after we
     // see AGENT_READY, otherwise the pipe buffer fills and FC stalls.
@@ -78,24 +78,20 @@ async fn wait_for_agent_ready(
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line.contains("AGENT_READY") {
-                        ready_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(_) if line.contains("AGENT_READY") => {
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(());
                     }
                 }
+                Ok(_) => {}
             }
         }
     });
 
-    let deadline = tokio::time::Instant::now() + timeout;
-    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
-        if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("Guest agent did not send AGENT_READY within {:?}", timeout);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    Ok(())
+    tokio::time::timeout(timeout, rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("Guest agent did not send AGENT_READY within {timeout:?}"))?
+        .map_err(|_| anyhow::anyhow!("Guest agent task exited before sending AGENT_READY"))
 }
 
 #[tokio::main]
